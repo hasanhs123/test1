@@ -208,7 +208,8 @@ async def on_startup():
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     if request.query_params.get("hub.mode") == "subscribe" and request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(request.query_params.get("hub.challenge"))
+        # 🔴 Fix: Return HTMLResponse so Meta sees plain text instead of JSON
+        return HTMLResponse(request.query_params.get("hub.challenge"))
     return HTMLResponse("Token Mismatch", status_code=403)
 
 @app.post("/webhook")

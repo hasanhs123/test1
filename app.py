@@ -24,14 +24,13 @@ MAX_PER_HOUR = 500
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
-# Helper to resolve proper external protocol and domain across reverse proxies (Render)
 def get_base_url(request: Request):
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.url.netloc)
     return f"{scheme}://{host}"
 
 # =========================================================
-# 1. DATABASE INITIALIZATION (SQLite)
+# 1. DATABASE INITIALIZATION
 # =========================================================
 def get_db():
     conn = sqlite3.connect(DB_FILE)
@@ -73,7 +72,7 @@ def init_db():
 init_db()
 
 # =========================================================
-# 2. FACEBOOK OAUTH LOGIN & AUTO-SUBSCRIPTION
+# 2. FACEBOOK OAUTH LOGIN
 # =========================================================
 @app.get("/auth/facebook")
 async def auth_facebook(request: Request):
@@ -102,7 +101,6 @@ async def auth_callback(request: Request, code: str = None):
         if not user_token:
             return HTMLResponse(f"Failed to get token: {res.text}")
 
-        # Fetch all pages managed by the authenticated user
         pages_url = "https://graph.facebook.com/v19.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
         pages_data = pages_res.json().get("data", [])
@@ -110,7 +108,6 @@ async def auth_callback(request: Request, code: str = None):
         with get_db() as conn:
             cursor = conn.cursor()
             for page in pages_data:
-                # Subscribe the page directly to webhook events
                 try:
                     await client.post(
                         f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
@@ -119,8 +116,8 @@ async def auth_callback(request: Request, code: str = None):
                             "subscribed_fields": "feed,messages"
                         }
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Subscription Error: {e}")
 
                 cursor.execute("""
                     INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
@@ -145,12 +142,7 @@ async def get_page_posts(page_id: str):
     
     async with httpx.AsyncClient() as client:
         url = f"https://graph.facebook.com/v19.0/{page_id}/published_posts"
-        params = {
-            "fields": "id,message,created_time,full_picture",
-            "access_token": access_token,
-            "limit": 15
-        }
-        res = await client.get(url, params=params)
+        res = await client.get(url, params={"fields": "id,message,created_time,full_picture", "access_token": access_token, "limit": 15})
         return res.json()
 
 # =========================================================
@@ -178,8 +170,8 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
-            # Anti-spam delay
             delay = random.randint(30, 45)
+            print(f"🎯 MATCH FOUND! Waiting {delay} seconds before sending DM to {sender_name}...")
             await asyncio.sleep(delay)
 
             full_name = sender_name.strip() if sender_name else "there"
@@ -187,30 +179,28 @@ async def process_queue():
             personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
             tracking_url = f"{app_base_url}/go/{campaign['id']}"
 
+            # 🔴 CRITICAL FIX: Facebook blocks templates in initial comment replies.
+            # We must use a standard text payload with the link inside the text.
+            final_message_text = f"{personalized_text}\n\n👉 {campaign['button_text']}: {tracking_url}"
+
             url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
             payload = {
                 "recipient": {"comment_id": comment_id},
-                "message": {
-                    "attachment": {
-                        "type": "template",
-                        "payload": {
-                            "template_type": "button",
-                            "text": personalized_text,
-                            "buttons": [{"type": "web_url", "url": tracking_url, "title": campaign["button_text"]}]
-                        }
-                    }
-                }
+                "message": {"text": final_message_text}
             }
 
             try:
+                print(f"🚀 SENDING DM PAYLOAD: {payload}")
                 res = await client.post(url, json=payload, params={"access_token": token})
+                print(f"📥 META API RESPONSE: {res.status_code} - {res.text}")
+                
                 if res.status_code == 200:
                     RATE_LIMIT_TRACKER[page_id]["count"] += 1
                     with get_db() as conn:
                         conn.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = ?", (campaign["id"],))
                         conn.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"❌ FATAL ERROR SENDING DM: {e}")
             message_queue.task_done()
 
 @app.on_event("startup")
@@ -244,6 +234,9 @@ async def verify_webhook(request: Request):
 async def handle_webhook(request: Request):
     data = await request.json()
     base_url = get_base_url(request)
+    
+    # NEW: Log every incoming webhook to the Render console
+    print(f"🔔 INCOMING WEBHOOK EVENT: {data}")
 
     try:
         for entry in data.get("entry", []):
@@ -278,7 +271,6 @@ async def handle_webhook(request: Request):
 
                         if campaign_row:
                             keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
-                            # True substring match: fires if any target keyword is located anywhere in the message
                             is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
                             
                             if is_matched:
@@ -286,12 +278,12 @@ async def handle_webhook(request: Request):
                                     "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
                                     "token": page_row["access_token"], "base_url": base_url, "campaign": dict(campaign_row)
                                 })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"❌ ERROR PROCESSING WEBHOOK: {e}")
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================
-# 7. DASHBOARD UI WITH EDIT MODAL
+# 7. DASHBOARD UI
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -363,7 +355,6 @@ async def dashboard():
         <style>.text-brand {{ color: #0fc261; }} .bg-brand {{ background-color: #0fc261; }}</style>
     </head>
     <body class="bg-[#f8fafc] text-slate-800 antialiased font-sans pb-16">
-        
         <header class="bg-white border-b border-gray-100 sticky top-0 z-30 shadow-sm">
             <div class="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center">
                 <div class="flex items-center gap-3">
@@ -408,21 +399,17 @@ async def dashboard():
             </section>
         </main>
 
-        <!-- ADD Campaign Modal -->
         <div id="addCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('addCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
                 <h3 class="text-lg font-extrabold text-slate-900 mb-1">Create Automation Rule</h3>
-                <p class="text-xs text-gray-400 mb-4 font-medium">Select a post and set your trigger words.</p>
-                
-                <form action="/add-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2">
+                <form action="/add-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2 mt-4">
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">Target Page</label>
                         <select name="page_id" id="page_selector" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500">
                             {pages_options}
                         </select>
                     </div>
-
                     <div>
                         <label class="block font-bold text-gray-600 mb-1 flex justify-between"><span>Select Target Video/Post</span> <span id="loading_posts" class="hidden text-blue-600"><i class="fa-solid fa-spinner fa-spin"></i> Fetching...</span></label>
                         <div id="post_grid" class="grid grid-cols-1 gap-2 max-h-40 overflow-y-auto border border-gray-200 p-2 rounded-xl bg-gray-50 mb-2">
@@ -431,17 +418,16 @@ async def dashboard():
                         <input type="hidden" name="post_id" id="hidden_post_id" required>
                         <button type="button" onclick="selectAllPosts()" class="w-full py-2 bg-slate-100 text-slate-600 rounded-lg font-bold hover:bg-slate-200 transition">Or apply to ALL future posts on this page</button>
                     </div>
-
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Puzzle Rule" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message (Use <code>{{{{first_name}}}}</code>)</label>
-                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right! Claim reward:" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
-                        <div><label class="block font-bold text-gray-600 mb-1">Button Label</label><input type="text" name="button_text" required placeholder="Claim $100 💸" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Button Label (Text Link)</label><input type="text" name="button_text" required placeholder="Claim $100 💸" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" required value="https://getreward.fun" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
@@ -449,14 +435,11 @@ async def dashboard():
             </div>
         </div>
 
-        <!-- EDIT Campaign Modal -->
         <div id="editCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('editCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
                 <h3 class="text-lg font-extrabold text-slate-900 mb-1">Edit Automation Rule</h3>
-                <p class="text-xs text-gray-400 mb-4 font-medium">Update trigger words or DM payload.</p>
-                
-                <form action="/edit-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2">
+                <form action="/edit-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2 mt-4">
                     <input type="hidden" name="campaign_id" id="edit_campaign_id">
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" id="edit_campaign_name" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
@@ -467,7 +450,7 @@ async def dashboard():
                         <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
-                        <div><label class="block font-bold text-gray-600 mb-1">Button Label</label><input type="text" name="button_text" id="edit_button_text" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Button Label (Text Link)</label><input type="text" name="button_text" id="edit_button_text" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" id="edit_button_url" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
@@ -532,7 +515,7 @@ async def dashboard():
                     }}
                 }} catch (e) {{
                     loader.classList.add('hidden');
-                    grid.innerHTML = '<div class="text-red-400 text-xs text-center py-4">Error loading posts. Make sure page permissions are correct.</div>';
+                    grid.innerHTML = '<div class="text-red-400 text-xs text-center py-4">Error loading posts. Make sure permissions are correct.</div>';
                 }}
             }});
         </script>

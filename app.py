@@ -24,7 +24,7 @@ MAX_PER_HOUR = 500
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
-# Helper to get the correct URL (handles localhost and cloud HTTPS automatically)
+# Helper to get the correct URL
 def get_base_url(request: Request):
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.url.netloc)
@@ -73,7 +73,7 @@ def init_db():
 init_db()
 
 # =========================================================
-# 2. FACEBOOK OAUTH LOGIN SYSTEM (The Manychat Way)
+# 2. FACEBOOK OAUTH LOGIN SYSTEM
 # =========================================================
 @app.get("/auth/facebook")
 async def auth_facebook(request: Request):
@@ -90,7 +90,6 @@ async def auth_callback(request: Request, code: str = None):
     redirect_uri = get_base_url(request) + "/auth/callback"
     
     async with httpx.AsyncClient() as client:
-        # Exchange login code for an Access Token
         token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
         res = await client.get(token_url, params={
             "client_id": FB_APP_ID,
@@ -103,12 +102,10 @@ async def auth_callback(request: Request, code: str = None):
         if not user_token:
             return HTMLResponse(f"Failed to get token: {res.text}")
 
-        # Fetch all pages the user manages
         pages_url = "https://graph.facebook.com/v19.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
         pages_data = pages_res.json().get("data", [])
 
-        # Save pages and their permanent page-level access tokens to the database
         with get_db() as conn:
             cursor = conn.cursor()
             for page in pages_data:
@@ -121,7 +118,7 @@ async def auth_callback(request: Request, code: str = None):
     return RedirectResponse("/")
 
 # =========================================================
-# 3. DYNAMIC POST FETCHER (Visual Select API)
+# 3. DYNAMIC POST FETCHER
 # =========================================================
 @app.get("/api/posts/{page_id}")
 async def get_page_posts(page_id: str):
@@ -138,13 +135,13 @@ async def get_page_posts(page_id: str):
         params = {
             "fields": "id,message,created_time,full_picture",
             "access_token": access_token,
-            "limit": 15 # Pulls the 15 most recent videos/posts
+            "limit": 15
         }
         res = await client.get(url, params=params)
         return res.json()
 
 # =========================================================
-# 4. ASYNC BACKGROUND WORKER (Delays & DMs)
+# 4. ASYNC BACKGROUND WORKER
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -221,7 +218,7 @@ async def track_and_redirect(campaign_id: int):
         return RedirectResponse(url=destination, status_code=302)
 
 # =========================================================
-# 6. META WEBHOOK (Verification & Receiver)
+# 6. META WEBHOOK 
 # =========================================================
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -266,7 +263,9 @@ async def handle_webhook(request: Request):
 
                         if campaign_row:
                             keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
+                            # Substring matching: If any keyword is found inside the full comment text, it matches!
                             is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
+                            
                             if is_matched:
                                 await message_queue.put({
                                     "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
@@ -277,7 +276,7 @@ async def handle_webhook(request: Request):
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================
-# 7. RESPONSIVE DASHBOARD UI WITH VISUAL POST PICKER
+# 7. RESPONSIVE DASHBOARD UI WITH EDIT FEATURE
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -313,18 +312,28 @@ async def dashboard():
     for c in campaigns:
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         ctr = f"{(c['link_clicks'] / c['dms_sent'] * 100):.1f}%" if c['dms_sent'] > 0 else "0.0%"
+        
+        # Add Edit and Delete buttons
+        actions = f"""
+        <div class="flex items-center justify-end gap-3">
+            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text']}`, `{c['button_text']}`, `{c['button_url']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <form action="/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
+                <input type="hidden" name="campaign_id" value="{c['id']}">
+                <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
+            </form>
+        </div>
+        """
+        
         campaigns_rows_html += f"""
         <tr class="border-b border-gray-50 hover:bg-gray-50/50 text-xs">
             <td class="py-4 px-4 font-bold text-slate-900">{c["campaign_name"]}<br><span class="text-[10px] text-gray-400 font-normal">Page: {c["page_name"]}</span></td>
             <td class="py-4 px-4 font-mono font-bold text-blue-600 truncate max-w-[100px]" title="{c["post_id"]}">{c["post_id"]}</td>
-            <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px]">{c["trigger_keywords"]}</span></td>
+            <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px] break-all">{c["trigger_keywords"]}</span></td>
             <td class="py-4 px-4 text-center font-bold text-slate-800">{c["dms_sent"]}</td>
             <td class="py-4 px-4 text-center font-bold text-green-600">{c["link_clicks"]}</td>
             <td class="py-4 px-4 text-center font-extrabold text-brand">{ctr}</td>
             <td class="py-4 px-4 text-center">{status}</td>
-            <td class="py-4 px-4 text-right">
-                <form action="/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');"><input type="hidden" name="campaign_id" value="{c["id"]}"><button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600">Delete</button></form>
-            </td>
+            <td class="py-4 px-4 text-right">{actions}</td>
         </tr>
         """
 
@@ -351,7 +360,6 @@ async def dashboard():
         </header>
 
         <main class="max-w-7xl mx-auto px-6 py-10 space-y-10">
-            <!-- Pages Section -->
             <section class="space-y-4">
                 <div class="flex justify-between items-center">
                     <h2 class="text-base font-extrabold text-slate-900 uppercase tracking-wider">1. Connected Pages</h2>
@@ -364,7 +372,6 @@ async def dashboard():
                 </div>
             </section>
 
-            <!-- Campaigns Section -->
             <section class="space-y-4">
                 <div class="flex justify-between items-center">
                     <h2 class="text-base font-extrabold text-slate-900 uppercase tracking-wider">2. Automation Rules</h2>
@@ -387,7 +394,7 @@ async def dashboard():
             </section>
         </main>
 
-        <!-- Dynamic Post Picker Modal -->
+        <!-- ADD Campaign Modal -->
         <div id="addCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('addCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
@@ -402,7 +409,6 @@ async def dashboard():
                         </select>
                     </div>
 
-                    <!-- Visual Post Picker Grid -->
                     <div>
                         <label class="block font-bold text-gray-600 mb-1 flex justify-between"><span>Select Target Video/Post</span> <span id="loading_posts" class="hidden text-blue-600"><i class="fa-solid fa-spinner fa-spin"></i> Fetching...</span></label>
                         <div id="post_grid" class="grid grid-cols-1 gap-2 max-h-40 overflow-y-auto border border-gray-200 p-2 rounded-xl bg-gray-50 mb-2">
@@ -414,17 +420,43 @@ async def dashboard():
 
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Key Puzzle" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="3, key 3, three" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97, three" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
-                        <label class="block font-bold text-gray-600 mb-1">DM Message (Use <code>{{first_name}}</code>)</label>
-                        <textarea name="dm_text" required rows="2" placeholder="Hi {{first_name}}! You found it. Claim reward:" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <label class="block font-bold text-gray-600 mb-1">DM Message (Use <code>{{{{first_name}}}}</code>)</label>
+                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You found it. Claim reward:" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Button Label</label><input type="text" name="button_text" required placeholder="Claim $100 💸" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" required value="https://getreward.fun" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- EDIT Campaign Modal -->
+        <div id="editCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+            <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
+                <button onclick="document.getElementById('editCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
+                <h3 class="text-lg font-extrabold text-slate-900 mb-1">Edit Automation Rule</h3>
+                <p class="text-xs text-gray-400 mb-4 font-medium">Update your keywords and messages.</p>
+                
+                <form action="/edit-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2">
+                    <input type="hidden" name="campaign_id" id="edit_campaign_id">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" id="edit_campaign_name" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                    </div>
+                    <div>
+                        <label class="block font-bold text-gray-600 mb-1">DM Message</label>
+                        <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="block font-bold text-gray-600 mb-1">Button Label</label><input type="text" name="button_text" id="edit_button_text" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" id="edit_button_url" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                    </div>
+                    <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
                 </form>
             </div>
         </div>
@@ -440,6 +472,16 @@ async def dashboard():
                 document.getElementById('hidden_post_id').value = postId;
                 document.querySelectorAll('.post-card').forEach(c => c.classList.remove('ring-2', 'ring-blue-500', 'bg-blue-50'));
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
+            }}
+
+            function editCampaign(id, name, keywords, dm_text, button_text, button_url) {{
+                document.getElementById('edit_campaign_id').value = id;
+                document.getElementById('edit_campaign_name').value = name;
+                document.getElementById('edit_trigger_keywords').value = keywords;
+                document.getElementById('edit_dm_text').value = dm_text;
+                document.getElementById('edit_button_text').value = button_text;
+                document.getElementById('edit_button_url').value = button_url;
+                document.getElementById('editCampaignModal').classList.remove('hidden');
             }}
 
             document.getElementById('page_selector').addEventListener('change', async function() {{
@@ -491,6 +533,17 @@ async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...),
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
+        conn.commit()
+    return HTMLResponse("<script>window.location.href='/';</script>")
+
+@app.post("/edit-campaign")
+async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(...), button_url: str = Form(...)):
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE campaigns 
+            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?, button_text = ?, button_url = ?
+            WHERE id = ?
+        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return HTMLResponse("<script>window.location.href='/';</script>")
 

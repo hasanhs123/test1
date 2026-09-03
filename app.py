@@ -205,17 +205,16 @@ async def on_startup():
 # =========================================================
 # 5. META WEBHOOK
 # =========================================================
-@app.get("/webhook")
-async def verify_webhook(request: Request):
-    if request.query_params.get("hub.mode") == "subscribe" and request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
-        # 🔴 Fix: Return HTMLResponse so Meta sees plain text instead of JSON
-        return HTMLResponse(request.query_params.get("hub.challenge"))
-    return HTMLResponse("Token Mismatch", status_code=403)
-
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    data = await request.json()
-    print(f"🔔 INCOMING WEBHOOK EVENT: {data}")
+    # This will print immediately if ANY post hits the webhook, valid or invalid json
+    try:
+        body = await request.body()
+        print(f"🔔 RAW POST RECEIVED: {body.decode()}")
+        data = await request.json()
+    except Exception as e:
+        print(f"❌ JSON PARSE ERROR: {e}")
+        return {"status": "ERROR"}
 
     try:
         for entry in data.get("entry", []):
@@ -258,7 +257,7 @@ async def handle_webhook(request: Request):
                                     "token": page_row["access_token"], "campaign": dict(campaign_row)
                                 })
     except Exception as e:
-        print(f"❌ ERROR PROCESSING WEBHOOK: {e}")
+        print(f"❌ ERROR PROCESSING WEBHOOK LOGIC: {e}")
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================

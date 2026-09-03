@@ -99,7 +99,7 @@ async def auth_callback(request: Request, code: str = None):
         user_token = res.json().get("access_token")
         
         if not user_token:
-            return HTMLResponse(f"Failed to get token: {res.text}")
+            return HTMLResponse(f"Failed to get token.")
 
         pages_url = "https://graph.facebook.com/v19.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
@@ -116,8 +116,8 @@ async def auth_callback(request: Request, code: str = None):
                             "subscribed_fields": "feed,messages"
                         }
                     )
-                except Exception as e:
-                    print(f"Subscription Error: {e}")
+                except Exception:
+                    pass
 
                 cursor.execute("""
                     INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
@@ -157,7 +157,6 @@ async def process_queue():
             sender_name = job["sender_name"]
             campaign = job["campaign"]
             token = job["token"]
-            app_base_url = job["base_url"]
 
             curr_time = time.time()
             if page_id not in RATE_LIMIT_TRACKER:
@@ -177,16 +176,11 @@ async def process_queue():
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
             personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
-            tracking_url = f"{app_base_url}/go/{campaign['id']}"
-
-            # 🔴 CRITICAL FIX: Facebook blocks templates in initial comment replies.
-            # We must use a standard text payload with the link inside the text.
-            final_message_text = f"{personalized_text}\n\n👉 {campaign['button_text']}: {tracking_url}"
 
             url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
             payload = {
                 "recipient": {"comment_id": comment_id},
-                "message": {"text": final_message_text}
+                "message": {"text": personalized_text}
             }
 
             try:
@@ -207,22 +201,9 @@ async def process_queue():
 async def on_startup():
     asyncio.create_task(process_queue())
 
-# =========================================================
-# 5. CLICK TRACKING & REDIRECT ROUTE
-# =========================================================
-@app.get("/go/{campaign_id}")
-async def track_and_redirect(campaign_id: int):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = ?", (campaign_id,))
-        cursor.execute("SELECT button_url FROM campaigns WHERE id = ?", (campaign_id,))
-        row = cursor.fetchone()
-        conn.commit()
-        destination = row["button_url"] if row else "https://getreward.fun"
-        return RedirectResponse(url=destination, status_code=302)
 
 # =========================================================
-# 6. META WEBHOOK
+# 5. META WEBHOOK
 # =========================================================
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -233,9 +214,6 @@ async def verify_webhook(request: Request):
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     data = await request.json()
-    base_url = get_base_url(request)
-    
-    # NEW: Log every incoming webhook to the Render console
     print(f"🔔 INCOMING WEBHOOK EVENT: {data}")
 
     try:
@@ -276,14 +254,14 @@ async def handle_webhook(request: Request):
                             if is_matched:
                                 await message_queue.put({
                                     "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
-                                    "token": page_row["access_token"], "base_url": base_url, "campaign": dict(campaign_row)
+                                    "token": page_row["access_token"], "campaign": dict(campaign_row)
                                 })
     except Exception as e:
         print(f"❌ ERROR PROCESSING WEBHOOK: {e}")
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================
-# 7. DASHBOARD UI
+# 6. DASHBOARD UI (BUTTONS & LINKS REMOVED)
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -318,11 +296,10 @@ async def dashboard():
     campaigns_rows_html = ""
     for c in campaigns:
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
-        ctr = f"{(c['link_clicks'] / c['dms_sent'] * 100):.1f}%" if c['dms_sent'] > 0 else "0.0%"
         
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text']}`, `{c['button_text']}`, `{c['button_url']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -336,8 +313,6 @@ async def dashboard():
             <td class="py-4 px-4 font-mono font-bold text-blue-600 truncate max-w-[100px]" title="{c["post_id"]}">{c["post_id"]}</td>
             <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px] break-all">{c["trigger_keywords"]}</span></td>
             <td class="py-4 px-4 text-center font-bold text-slate-800">{c["dms_sent"]}</td>
-            <td class="py-4 px-4 text-center font-bold text-green-600">{c["link_clicks"]}</td>
-            <td class="py-4 px-4 text-center font-extrabold text-brand">{ctr}</td>
             <td class="py-4 px-4 text-center">{status}</td>
             <td class="py-4 px-4 text-right">{actions}</td>
         </tr>
@@ -388,11 +363,11 @@ async def dashboard():
                             <thead>
                                 <tr class="bg-gray-50/70 border-b border-gray-100 text-[10px] font-extrabold text-gray-400 uppercase tracking-wider">
                                     <th class="py-3 px-4">Campaign</th><th class="py-3 px-4">Target Post</th><th class="py-3 px-4">Keywords</th>
-                                    <th class="py-3 px-4 text-center">Sent</th><th class="py-3 px-4 text-center">Clicks</th><th class="py-3 px-4 text-center">CTR</th>
+                                    <th class="py-3 px-4 text-center">Sent</th>
                                     <th class="py-3 px-4 text-center">Status</th><th class="py-3 px-4 text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="8" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
+                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="6" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
                         </table>
                     </div>
                 </div>
@@ -423,12 +398,8 @@ async def dashboard():
                         <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
-                        <label class="block font-bold text-gray-600 mb-1">DM Message (Use <code>{{{{first_name}}}}</code>)</label>
-                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
-                    </div>
-                    <div class="grid grid-cols-2 gap-3">
-                        <div><label class="block font-bold text-gray-600 mb-1">Button Label (Text Link)</label><input type="text" name="button_text" required placeholder="Claim $100 💸" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" required value="https://getreward.fun" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <label class="block font-bold text-gray-600 mb-1">DM Message Text (Use <code>{{{{first_name}}}}</code>)</label>
+                        <textarea name="dm_text" required rows="3" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
                 </form>
@@ -446,12 +417,8 @@ async def dashboard():
                         <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
-                        <label class="block font-bold text-gray-600 mb-1">DM Message</label>
-                        <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
-                    </div>
-                    <div class="grid grid-cols-2 gap-3">
-                        <div><label class="block font-bold text-gray-600 mb-1">Button Label (Text Link)</label><input type="text" name="button_text" id="edit_button_text" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Target URL</label><input type="url" name="button_url" id="edit_button_url" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <label class="block font-bold text-gray-600 mb-1">DM Message Text</label>
+                        <textarea name="dm_text" id="edit_dm_text" required rows="3" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
                 </form>
@@ -471,13 +438,11 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, dm_text, button_text, button_url) {{
+            function editCampaign(id, name, keywords, dm_text) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
                 document.getElementById('edit_dm_text').value = dm_text;
-                document.getElementById('edit_button_text').value = button_text;
-                document.getElementById('edit_button_url').value = button_url;
                 document.getElementById('editCampaignModal').classList.remove('hidden');
             }}
 
@@ -525,22 +490,23 @@ async def dashboard():
     return HTMLResponse(html)
 
 @app.post("/add-campaign")
-async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(...), button_url: str = Form(...)):
+async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...)):
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
+        # Inserting blank strings for button_text and button_url to prevent SQLite errors
+        cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, '', '', 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip()))
         conn.commit()
     return HTMLResponse("<script>window.location.href='/';</script>")
 
 @app.post("/edit-campaign")
-async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(...), button_url: str = Form(...)):
+async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...)):
     with get_db() as conn:
         conn.execute("""
             UPDATE campaigns 
-            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?, button_text = ?, button_url = ?
+            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?
             WHERE id = ?
-        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
+        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), campaign_id))
         conn.commit()
     return HTMLResponse("<script>window.location.href='/';</script>")
 

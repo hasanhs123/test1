@@ -24,7 +24,7 @@ MAX_PER_HOUR = 500
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
-# Helper to get the correct URL
+# Helper to resolve proper external protocol and domain across reverse proxies (Render)
 def get_base_url(request: Request):
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.url.netloc)
@@ -73,12 +73,12 @@ def init_db():
 init_db()
 
 # =========================================================
-# 2. FACEBOOK OAUTH LOGIN SYSTEM
+# 2. FACEBOOK OAUTH LOGIN & AUTO-SUBSCRIPTION
 # =========================================================
 @app.get("/auth/facebook")
 async def auth_facebook(request: Request):
     redirect_uri = get_base_url(request) + "/auth/callback"
-    scopes = "pages_show_list,pages_read_engagement,pages_manage_posts,pages_messaging"
+    scopes = "pages_show_list,pages_read_engagement,pages_manage_posts,pages_messaging,pages_manage_metadata"
     auth_url = f"https://www.facebook.com/v19.0/dialog/oauth?client_id={FB_APP_ID}&redirect_uri={redirect_uri}&scope={scopes}"
     return RedirectResponse(auth_url)
 
@@ -102,6 +102,7 @@ async def auth_callback(request: Request, code: str = None):
         if not user_token:
             return HTMLResponse(f"Failed to get token: {res.text}")
 
+        # Fetch all pages managed by the authenticated user
         pages_url = "https://graph.facebook.com/v19.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
         pages_data = pages_res.json().get("data", [])
@@ -109,15 +110,18 @@ async def auth_callback(request: Request, code: str = None):
         with get_db() as conn:
             cursor = conn.cursor()
             for page in pages_data:
-                # 🔴 NEW: Tell Facebook to subscribe this page to your webhook
-                await client.post(
-                    f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
-                    params={
-                        "access_token": page["access_token"],
-                        "subscribed_fields": "feed,messages"
-                    }
-                )
-                
+                # Subscribe the page directly to webhook events
+                try:
+                    await client.post(
+                        f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
+                        params={
+                            "access_token": page["access_token"],
+                            "subscribed_fields": "feed,messages"
+                        }
+                    )
+                except Exception:
+                    pass
+
                 cursor.execute("""
                     INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
                     VALUES (?, ?, ?)
@@ -150,7 +154,7 @@ async def get_page_posts(page_id: str):
         return res.json()
 
 # =========================================================
-# 4. ASYNC BACKGROUND WORKER
+# 4. ASYNC BACKGROUND WORKER (Delay & Messaging)
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -174,6 +178,7 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
+            # Anti-spam delay
             delay = random.randint(30, 45)
             await asyncio.sleep(delay)
 
@@ -204,7 +209,7 @@ async def process_queue():
                     with get_db() as conn:
                         conn.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = ?", (campaign["id"],))
                         conn.commit()
-            except Exception as e:
+            except Exception:
                 pass
             message_queue.task_done()
 
@@ -227,7 +232,7 @@ async def track_and_redirect(campaign_id: int):
         return RedirectResponse(url=destination, status_code=302)
 
 # =========================================================
-# 6. META WEBHOOK 
+# 6. META WEBHOOK
 # =========================================================
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -262,7 +267,8 @@ async def handle_webhook(request: Request):
                         cursor = conn.cursor()
                         cursor.execute("SELECT access_token FROM pages WHERE page_id = ?", (page_id,))
                         page_row = cursor.fetchone()
-                        if not page_row: continue
+                        if not page_row:
+                            continue
                         
                         cursor.execute("SELECT * FROM campaigns WHERE page_id = ? AND post_id = ? AND is_active = 1", (page_id, post_id))
                         campaign_row = cursor.fetchone()
@@ -272,7 +278,7 @@ async def handle_webhook(request: Request):
 
                         if campaign_row:
                             keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
-                            # Substring matching: If any keyword is found inside the full comment text, it matches!
+                            # True substring match: fires if any target keyword is located anywhere in the message
                             is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
                             
                             if is_matched:
@@ -280,12 +286,12 @@ async def handle_webhook(request: Request):
                                     "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
                                     "token": page_row["access_token"], "base_url": base_url, "campaign": dict(campaign_row)
                                 })
-    except Exception as e:
+    except Exception:
         pass
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================
-# 7. RESPONSIVE DASHBOARD UI WITH EDIT FEATURE
+# 7. DASHBOARD UI WITH EDIT MODAL
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -322,7 +328,6 @@ async def dashboard():
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         ctr = f"{(c['link_clicks'] / c['dms_sent'] * 100):.1f}%" if c['dms_sent'] > 0 else "0.0%"
         
-        # Add Edit and Delete buttons
         actions = f"""
         <div class="flex items-center justify-end gap-3">
             <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text']}`, `{c['button_text']}`, `{c['button_url']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
@@ -428,12 +433,12 @@ async def dashboard():
                     </div>
 
                     <div class="grid grid-cols-2 gap-3">
-                        <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Key Puzzle" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97, three" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Puzzle Rule" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message (Use <code>{{{{first_name}}}}</code>)</label>
-                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You found it. Claim reward:" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right! Claim reward:" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Button Label</label><input type="text" name="button_text" required placeholder="Claim $100 💸" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
@@ -449,7 +454,7 @@ async def dashboard():
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('editCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
                 <h3 class="text-lg font-extrabold text-slate-900 mb-1">Edit Automation Rule</h3>
-                <p class="text-xs text-gray-400 mb-4 font-medium">Update your keywords and messages.</p>
+                <p class="text-xs text-gray-400 mb-4 font-medium">Update trigger words or DM payload.</p>
                 
                 <form action="/edit-campaign" method="post" class="space-y-4 text-xs overflow-y-auto pr-2">
                     <input type="hidden" name="campaign_id" id="edit_campaign_id">

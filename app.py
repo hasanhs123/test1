@@ -99,7 +99,7 @@ async def auth_callback(request: Request, code: str = None):
         user_token = res.json().get("access_token")
         
         if not user_token:
-            return HTMLResponse(f"Failed to get token.")
+            return HTMLResponse(f"Failed to get token: {res.text}")
 
         pages_url = "https://graph.facebook.com/v19.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
@@ -109,15 +109,16 @@ async def auth_callback(request: Request, code: str = None):
             cursor = conn.cursor()
             for page in pages_data:
                 try:
-                    await client.post(
+                    sub_res = await client.post(
                         f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
                         params={
                             "access_token": page["access_token"],
                             "subscribed_fields": "feed,messages"
                         }
                     )
-                except Exception:
-                    pass
+                    print(f"🔗 Page Subscription Result for {page['name']}: {sub_res.status_code} - {sub_res.text}")
+                except Exception as e:
+                    print(f"❌ Page Subscription Exception: {e}")
 
                 cursor.execute("""
                     INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
@@ -201,7 +202,6 @@ async def process_queue():
 async def on_startup():
     asyncio.create_task(process_queue())
 
-
 # =========================================================
 # 5. META WEBHOOK
 # =========================================================
@@ -232,7 +232,6 @@ async def handle_webhook(request: Request):
                             conn.commit()
             for change in entry.get("changes", []):
                 value = change.get("value", {})
-                # 🔴 Relaxed filter to catch all comment / feed addition events
                 if change.get("field") == "feed" and (value.get("verb") == "add" or value.get("item") == "comment"):
                     comment_text = value.get("message", "").strip().lower()
                     comment_id = value.get("comment_id")

@@ -261,12 +261,12 @@ async def handle_webhook(request: Request):
 
     try:
         for entry in data.get("entry", []):
-            page_id = str(entry.get("id"))
+            entry_id = str(entry.get("id") or "")
             # "pages_messaging" webhook sends a single entry id that is the page id
             for msg_event in entry.get("messaging", []):
                 if "read" in msg_event:
                     with get_db() as conn:
-                        conn.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = ?", (page_id,))
+                        conn.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = ?", (entry_id,))
                         conn.commit()
             for change in entry.get("changes", []):
                 value = change.get("value", {})
@@ -277,6 +277,14 @@ async def handle_webhook(request: Request):
                     raw_post_id = str(value.get("post_id", ""))
                     # post_id arrives like "PAGEID_POSTID"; keep only the POST id part
                     post_id = raw_post_id.split("_")[-1] if "_" in raw_post_id else raw_post_id
+                    # The page id: for the 'page' object entry.id IS the page id,
+                    # but for the 'user'/'app' object the first segment of post_id
+                    # also contains the page id, so use whichever is in our DB.
+                    page_id = entry_id
+                    if "_" in raw_post_id:
+                        page_id_from_post = raw_post_id.split("_")[0]
+                        if page_id_from_post != entry_id:
+                            page_id = page_id_from_post
 
                     logger.info("Comment received page=%s post=%s comment=%s text=%s from=%s", page_id, post_id, comment_id, comment_text, sender_name)
 
@@ -284,6 +292,11 @@ async def handle_webhook(request: Request):
                         cursor = conn.cursor()
                         cursor.execute("SELECT access_token FROM pages WHERE page_id = ?", (page_id,))
                         page_row = cursor.fetchone()
+                        if not page_row:
+                            cursor.execute("SELECT access_token FROM pages WHERE page_id = ?", (entry_id,))
+                            page_row = cursor.fetchone()
+                            if page_row:
+                                page_id = entry_id
                         if not page_row:
                             logger.warning("Page %s not connected yet, skipping", page_id)
                             continue

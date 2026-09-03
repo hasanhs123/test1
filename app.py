@@ -205,9 +205,14 @@ async def on_startup():
 # =========================================================
 # 5. META WEBHOOK
 # =========================================================
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    if request.query_params.get("hub.mode") == "subscribe" and request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
+        return HTMLResponse(request.query_params.get("hub.challenge"))
+    return HTMLResponse("Token Mismatch", status_code=403)
+
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    # This will print immediately if ANY post hits the webhook, valid or invalid json
     try:
         body = await request.body()
         print(f"🔔 RAW POST RECEIVED: {body.decode()}")
@@ -227,7 +232,8 @@ async def handle_webhook(request: Request):
                             conn.commit()
             for change in entry.get("changes", []):
                 value = change.get("value", {})
-                if change.get("field") == "feed" and value.get("item") == "comment" and value.get("verb") == "add":
+                # 🔴 Relaxed filter to catch all comment / feed addition events
+                if change.get("field") == "feed" and (value.get("verb") == "add" or value.get("item") == "comment"):
                     comment_text = value.get("message", "").strip().lower()
                     comment_id = value.get("comment_id")
                     sender_name = value.get("from", {}).get("name", "there")
@@ -261,7 +267,7 @@ async def handle_webhook(request: Request):
     return {"status": "EVENT_RECEIVED"}
 
 # =========================================================
-# 6. DASHBOARD UI (BUTTONS & LINKS REMOVED)
+# 6. DASHBOARD UI
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -494,7 +500,6 @@ async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...),
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
     with get_db() as conn:
         cursor = conn.cursor()
-        # Inserting blank strings for button_text and button_url to prevent SQLite errors
         cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, '', '', 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip()))
         conn.commit()
     return HTMLResponse("<script>window.location.href='/';</script>")

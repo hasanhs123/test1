@@ -109,6 +109,15 @@ async def auth_callback(request: Request, code: str = None):
         with get_db() as conn:
             cursor = conn.cursor()
             for page in pages_data:
+                # 🔴 NEW: Tell Facebook to subscribe this page to your webhook
+                await client.post(
+                    f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
+                    params={
+                        "access_token": page["access_token"],
+                        "subscribed_fields": "feed,messages"
+                    }
+                )
+                
                 cursor.execute("""
                     INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
                     VALUES (?, ?, ?)

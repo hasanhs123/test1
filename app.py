@@ -26,7 +26,6 @@ RATE_LIMIT_TRACKER = {}
 
 def get_base_url(request: Request):
     host = request.headers.get("x-forwarded-host", request.url.netloc)
-    # Force HTTPS on Render to satisfy Facebook's strict OAuth rules
     scheme = "http" if "localhost" in host or "127.0.0.1" in host else "https"
     return f"{scheme}://{host}"
 
@@ -34,7 +33,6 @@ def get_base_url(request: Request):
 # 1. DATABASE INITIALIZATION
 # =========================================================
 def get_db():
-    # check_same_thread=False prevents FastAPI async pool crashes
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -178,13 +176,42 @@ async def process_queue():
 
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
+            
+            # Format personalized text
             personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
+            
+            # Check if a button was added in the dashboard
+            if campaign.get("button_url"):
+                link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
+                
+                # META GRAPH API BUTTON TEMPLATE
+                payload = {
+                    "recipient": {"comment_id": comment_id},
+                    "message": {
+                        "attachment": {
+                            "type": "template",
+                            "payload": {
+                                "template_type": "button",
+                                "text": personalized_text,
+                                "buttons": [
+                                    {
+                                        "type": "web_url",
+                                        "url": campaign["button_url"],
+                                        "title": link_title
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            else:
+                # STANDARD TEXT PAYLOAD
+                payload = {
+                    "recipient": {"comment_id": comment_id},
+                    "message": {"text": personalized_text}
+                }
 
             url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
-            payload = {
-                "recipient": {"comment_id": comment_id},
-                "message": {"text": personalized_text}
-            }
 
             try:
                 print(f"🚀 SENDING DM PAYLOAD: {payload}")
@@ -205,12 +232,11 @@ async def on_startup():
     asyncio.create_task(process_queue())
 
 # =========================================================
-# 5. META WEBHOOK (Bulletproof Parsing)
+# 5. META WEBHOOK
 # =========================================================
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     if request.query_params.get("hub.mode") == "subscribe" and request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
-        # Strict plain text requirement for Facebook Webhook verification
         return PlainTextResponse(request.query_params.get("hub.challenge"))
     return PlainTextResponse("Token Mismatch", status_code=403)
 
@@ -244,12 +270,10 @@ async def handle_webhook(request: Request):
                 if change.get("field") == "feed" and value.get("verb") == "add":
                     item = value.get("item", "")
                     
-                    # Log and ignore Meta Dashboard test pings gracefully
                     if item == "status":
                         print("🟢 META TEST WEBHOOK PING RECEIVED AND VALIDATED!")
                         continue
                         
-                    # Filter out anything that is not an actual comment
                     if item != "comment":
                         continue
 
@@ -270,9 +294,10 @@ async def handle_webhook(request: Request):
                         campaign_row = cursor.fetchone()
                         if not campaign_row:
                             cursor.execute("SELECT * FROM campaigns WHERE page_id = ? AND post_id = 'ALL_POSTS' AND is_active = 1", (page_id,))
-                            campaign_row = cursor.fetchone()
+                            campaign_row =fetchone = cursor.fetchone()
 
                         if campaign_row:
+                            # Substring matching: this automatically handles keywords hidden inside longer sentences.
                             keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
                             is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
                             
@@ -284,7 +309,6 @@ async def handle_webhook(request: Request):
     except Exception as e:
         print(f"❌ ERROR PROCESSING WEBHOOK LOGIC: {e}")
         
-    # ALWAYS return a 200 Plain Text response to prevent Facebook from suspending the app
     return PlainTextResponse("EVENT_RECEIVED", status_code=200)
 
 # =========================================================
@@ -326,7 +350,7 @@ async def dashboard():
         
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text'].replace('`', '')}`, `{c['button_text']}`, `{c['button_url']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -354,7 +378,6 @@ async def dashboard():
         <title>EarnFlow Bot Control Panel</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>.text-brand {{ color: #0fc261; }} .bg-brand {{ background-color: #0fc261; }}</style>
     </head>
     <body class="bg-[#f8fafc] text-slate-800 antialiased font-sans pb-16">
         <header class="bg-white border-b border-gray-100 sticky top-0 z-30 shadow-sm">
@@ -401,6 +424,7 @@ async def dashboard():
             </section>
         </main>
 
+        <!-- ADD MODAL -->
         <div id="addCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('addCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
@@ -426,13 +450,18 @@ async def dashboard():
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message Text (Use <code>{{{{first_name}}}}</code>)</label>
-                        <textarea name="dm_text" required rows="3" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
+                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Play Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
                 </form>
             </div>
         </div>
 
+        <!-- EDIT MODAL -->
         <div id="editCampaignModal" class="hidden fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
             <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl p-6 relative max-h-[90vh] flex flex-col">
                 <button onclick="document.getElementById('editCampaignModal').classList.add('hidden')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800"><i class="fa-solid fa-xmark"></i></button>
@@ -445,7 +474,11 @@ async def dashboard():
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message Text</label>
-                        <textarea name="dm_text" id="edit_dm_text" required rows="3" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
+                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" placeholder="e.g. Play Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" id="edit_button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
                 </form>
@@ -465,11 +498,13 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, dm_text) {{
+            function editCampaign(id, name, keywords, dm_text, btn_text, btn_url) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
                 document.getElementById('edit_dm_text').value = dm_text;
+                document.getElementById('edit_button_text').value = btn_text;
+                document.getElementById('edit_button_url').value = btn_url;
                 document.getElementById('editCampaignModal').classList.remove('hidden');
             }}
 
@@ -517,22 +552,22 @@ async def dashboard():
     return HTMLResponse(html)
 
 @app.post("/add-campaign")
-async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...)):
+async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, '', '', 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip()))
+        cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/edit-campaign")
-async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...)):
+async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
     with get_db() as conn:
         conn.execute("""
             UPDATE campaigns 
-            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?
+            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?, button_text = ?, button_url = ?
             WHERE id = ?
-        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), campaign_id))
+        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url="/", status_code=303)
 

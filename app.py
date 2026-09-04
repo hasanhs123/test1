@@ -1,9 +1,10 @@
 import os
-import sqlite3
 import asyncio
 import random
 import time
 import httpx
+import psycopg2
+import psycopg2.extras
 from typing import Optional
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
@@ -12,14 +13,15 @@ import uvicorn
 app = FastAPI(title="Comment To DM Engine")
 
 # =========================================================
-# 🔴 PASTE YOUR META APP CREDENTIALS HERE
+# 🔴 META APP CREDENTIALS
 # =========================================================
 FB_APP_ID = "4540018746283778"
 FB_APP_SECRET = "44b48575462c74e05dc2dae3b7c74886"
 VERIFY_TOKEN = "hasan1235"
 # =========================================================
 
-DB_FILE = "bot_database.db"
+# Grabs the database URL you put in Render's Environment Variables
+DB_URL = os.environ.get("DATABASE_URL")
 MAX_PER_HOUR = 500
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
@@ -30,49 +32,60 @@ def get_base_url(request: Request):
     return f"{scheme}://{host}"
 
 # =========================================================
-# 1. DATABASE INITIALIZATION
+# 1. POSTGRES DATABASE INITIALIZATION
 # =========================================================
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DB_URL)
+    conn.cursor_factory = psycopg2.extras.DictCursor
     return conn
 
 def init_db():
+    if not DB_URL:
+        print("⚠️ WARNING: No DATABASE_URL found. Please add it to Render Environment Variables.")
+        return
+        
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pages (
-                page_id TEXT PRIMARY KEY,
-                page_name TEXT NOT NULL,
-                access_token TEXT NOT NULL,
-                dms_opened INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                page_id TEXT NOT NULL,
-                post_id TEXT NOT NULL,
-                campaign_name TEXT NOT NULL,
-                trigger_keywords TEXT NOT NULL,
-                dm_text TEXT NOT NULL,
-                button_text TEXT NOT NULL,
-                button_url TEXT NOT NULL,
-                dms_sent INTEGER DEFAULT 0,
-                link_clicks INTEGER DEFAULT 0,
-                is_active INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (page_id) REFERENCES pages (page_id),
-                UNIQUE(page_id, post_id)
-            )
-        """)
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pages (
+                    page_id TEXT PRIMARY KEY,
+                    page_name TEXT NOT NULL,
+                    access_token TEXT NOT NULL,
+                    dms_opened INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    id SERIAL PRIMARY KEY,
+                    page_id TEXT NOT NULL,
+                    post_id TEXT NOT NULL,
+                    campaign_name TEXT NOT NULL,
+                    trigger_keywords TEXT NOT NULL,
+                    dm_text TEXT NOT NULL,
+                    button_text TEXT NOT NULL,
+                    button_url TEXT NOT NULL,
+                    dms_sent INTEGER DEFAULT 0,
+                    link_clicks INTEGER DEFAULT 0,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (page_id) REFERENCES pages (page_id),
+                    UNIQUE(page_id, post_id)
+                )
+            """)
         conn.commit()
 
 init_db()
 
 # =========================================================
-# 2. FACEBOOK OAUTH LOGIN
+# 2. UPTIME KEEP-ALIVE ROUTE (NEW)
+# =========================================================
+@app.get("/ping")
+async def keep_alive():
+    return PlainTextResponse("Bot is awake and running 24/7!", status_code=200)
+
+# =========================================================
+# 3. FACEBOOK OAUTH LOGIN
 # =========================================================
 @app.get("/auth/facebook")
 async def auth_facebook(request: Request):
@@ -106,40 +119,57 @@ async def auth_callback(request: Request, code: str = None):
         pages_data = pages_res.json().get("data", [])
 
         with get_db() as conn:
-            cursor = conn.cursor()
-            for page in pages_data:
-                try:
-                    sub_res = await client.post(
-                        f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
-                        params={
-                            "access_token": page["access_token"],
-                            "subscribed_fields": "feed,messages"
-                        }
-                    )
-                    print(f"🔗 Page Subscription Result for {page['name']}: {sub_res.status_code} - {sub_res.text}")
-                except Exception as e:
-                    print(f"❌ Page Subscription Exception: {e}")
+            with conn.cursor() as cursor:
+                for page in pages_data:
+                    try:
+                        sub_res = await client.post(
+                            f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
+                            params={"access_token": page["access_token"], "subscribed_fields": "feed,messages"}
+                        )
+                        print(f"🔗 Page Subscription Result for {page['name']}: {sub_res.status_code} - {sub_res.text}")
+                    except Exception as e:
+                        print(f"❌ Page Subscription Exception: {e}")
 
-                cursor.execute("""
-                    INSERT OR REPLACE INTO pages (page_id, page_name, access_token) 
-                    VALUES (?, ?, ?)
-                """, (page["id"], page["name"], page["access_token"]))
+                    cursor.execute("""
+                        INSERT INTO pages (page_id, page_name, access_token) 
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (page_id) DO UPDATE SET 
+                        page_name = EXCLUDED.page_name, 
+                        access_token = EXCLUDED.access_token
+                    """, (page["id"], page["name"], page["access_token"]))
             conn.commit()
 
     return RedirectResponse("/")
 
 # =========================================================
-# 3. DYNAMIC POST FETCHER
+# 4. LINK CLICK TRACKER
+# =========================================================
+@app.get("/click/{campaign_id}")
+async def track_link_click(campaign_id: int):
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT button_url FROM campaigns WHERE id = %s", (campaign_id,))
+            row = cursor.fetchone()
+            
+            if row and row["button_url"]:
+                cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = %s", (campaign_id,))
+                conn.commit()
+                return RedirectResponse(row["button_url"])
+            
+    return PlainTextResponse("Link expired or invalid.")
+
+# =========================================================
+# 5. DYNAMIC POST FETCHER
 # =========================================================
 @app.get("/api/posts/{page_id}")
 async def get_page_posts(page_id: str):
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT access_token FROM pages WHERE page_id = ?", (page_id,))
-        row = cursor.fetchone()
-        if not row:
-            return JSONResponse({"error": "Page not found"}, status_code=404)
-        access_token = row["access_token"]
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT access_token FROM pages WHERE page_id = %s", (page_id,))
+            row = cursor.fetchone()
+            if not row:
+                return JSONResponse({"error": "Page not found"}, status_code=404)
+            access_token = row["access_token"]
     
     async with httpx.AsyncClient() as client:
         url = f"https://graph.facebook.com/v19.0/{page_id}/published_posts"
@@ -147,7 +177,7 @@ async def get_page_posts(page_id: str):
         return res.json()
 
 # =========================================================
-# 4. ASYNC BACKGROUND WORKER (Delay & Messaging)
+# 6. ASYNC BACKGROUND WORKER
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -158,6 +188,7 @@ async def process_queue():
             sender_name = job["sender_name"]
             campaign = job["campaign"]
             token = job["token"]
+            base_url = job["base_url"]
 
             curr_time = time.time()
             if page_id not in RATE_LIMIT_TRACKER:
@@ -177,14 +208,12 @@ async def process_queue():
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
             
-            # Format personalized text
             personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
             
-            # Check if a button was added in the dashboard
             if campaign.get("button_url"):
                 link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
+                tracking_url = f"{base_url}/click/{campaign['id']}"
                 
-                # META GRAPH API BUTTON TEMPLATE
                 payload = {
                     "recipient": {"comment_id": comment_id},
                     "message": {
@@ -193,19 +222,12 @@ async def process_queue():
                             "payload": {
                                 "template_type": "button",
                                 "text": personalized_text,
-                                "buttons": [
-                                    {
-                                        "type": "web_url",
-                                        "url": campaign["button_url"],
-                                        "title": link_title
-                                    }
-                                ]
+                                "buttons": [{"type": "web_url", "url": tracking_url, "title": link_title}]
                             }
                         }
                     }
                 }
             else:
-                # STANDARD TEXT PAYLOAD
                 payload = {
                     "recipient": {"comment_id": comment_id},
                     "message": {"text": personalized_text}
@@ -214,14 +236,12 @@ async def process_queue():
             url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
 
             try:
-                print(f"🚀 SENDING DM PAYLOAD: {payload}")
                 res = await client.post(url, json=payload, params={"access_token": token})
-                print(f"📥 META API RESPONSE: {res.status_code} - {res.text}")
-                
                 if res.status_code == 200:
                     RATE_LIMIT_TRACKER[page_id]["count"] += 1
                     with get_db() as conn:
-                        conn.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = ?", (campaign["id"],))
+                        with conn.cursor() as cursor:
+                            cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
                         conn.commit()
             except Exception as e:
                 print(f"❌ FATAL ERROR SENDING DM: {e}")
@@ -232,7 +252,7 @@ async def on_startup():
     asyncio.create_task(process_queue())
 
 # =========================================================
-# 5. META WEBHOOK
+# 7. META WEBHOOK
 # =========================================================
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -246,11 +266,8 @@ async def handle_webhook(request: Request):
         body_bytes = await request.body()
         if not body_bytes:
             return PlainTextResponse("EVENT_RECEIVED", status_code=200)
-            
-        print(f"🔔 RAW POST RECEIVED: {body_bytes.decode('utf-8')}")
         data = await request.json()
     except Exception as e:
-        print(f"❌ JSON PARSE ERROR: {e}")
         return PlainTextResponse("EVENT_RECEIVED", status_code=200)
 
     try:
@@ -261,7 +278,8 @@ async def handle_webhook(request: Request):
                 for msg_event in entry.get("messaging", []):
                     if "read" in msg_event:
                         with get_db() as conn:
-                            conn.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = ?", (page_id,))
+                            with conn.cursor() as cursor:
+                                cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
                             conn.commit()
                             
             for change in entry.get("changes", []):
@@ -269,59 +287,58 @@ async def handle_webhook(request: Request):
                 
                 if change.get("field") == "feed" and value.get("verb") == "add":
                     item = value.get("item", "")
-                    
-                    if item == "status":
-                        print("🟢 META TEST WEBHOOK PING RECEIVED AND VALIDATED!")
-                        continue
-                        
                     if item != "comment":
                         continue
 
                     comment_text = value.get("message", "").strip().lower()
                     comment_id = value.get("comment_id")
                     sender_name = value.get("from", {}).get("name", "there")
+                    sender_id = value.get("from", {}).get("id", "")
                     raw_post_id = str(value.get("post_id", ""))
                     post_id = raw_post_id.split("_")[-1] if "_" in raw_post_id else raw_post_id
 
-                    with get_db() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT access_token FROM pages WHERE page_id = ?", (page_id,))
-                        page_row = cursor.fetchone()
-                        if not page_row:
-                            continue
-                        
-                        cursor.execute("SELECT * FROM campaigns WHERE page_id = ? AND post_id = ? AND is_active = 1", (page_id, post_id))
-                        campaign_row = cursor.fetchone()
-                        if not campaign_row:
-                            cursor.execute("SELECT * FROM campaigns WHERE page_id = ? AND post_id = 'ALL_POSTS' AND is_active = 1", (page_id,))
-                            campaign_row =fetchone = cursor.fetchone()
+                    if sender_id == page_id:
+                        continue
 
-                        if campaign_row:
-                            # Substring matching: this automatically handles keywords hidden inside longer sentences.
-                            keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
-                            is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
+                    with get_db() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("SELECT access_token FROM pages WHERE page_id = %s", (page_id,))
+                            page_row = cursor.fetchone()
+                            if not page_row:
+                                continue
                             
-                            if is_matched:
-                                await message_queue.put({
-                                    "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
-                                    "token": page_row["access_token"], "campaign": dict(campaign_row)
-                                })
+                            cursor.execute("SELECT * FROM campaigns WHERE page_id = %s AND post_id = %s AND is_active = 1", (page_id, post_id))
+                            campaign_row = cursor.fetchone()
+                            if not campaign_row:
+                                cursor.execute("SELECT * FROM campaigns WHERE page_id = %s AND post_id = 'ALL_POSTS' AND is_active = 1", (page_id,))
+                                campaign_row = cursor.fetchone()
+
+                            if campaign_row:
+                                keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
+                                is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
+                                
+                                if is_matched:
+                                    await message_queue.put({
+                                        "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
+                                        "token": page_row["access_token"], "campaign": dict(campaign_row),
+                                        "base_url": get_base_url(request)
+                                    })
     except Exception as e:
         print(f"❌ ERROR PROCESSING WEBHOOK LOGIC: {e}")
         
     return PlainTextResponse("EVENT_RECEIVED", status_code=200)
 
 # =========================================================
-# 6. DASHBOARD UI
+# 8. DASHBOARD UI
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM pages ORDER BY created_at DESC")
-        pages = cursor.fetchall()
-        cursor.execute("SELECT c.*, p.page_name FROM campaigns c JOIN pages p ON c.page_id = p.page_id ORDER BY c.id DESC")
-        campaigns = cursor.fetchall()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM pages ORDER BY created_at DESC")
+            pages = cursor.fetchall()
+            cursor.execute("SELECT c.*, p.page_name FROM campaigns c JOIN pages p ON c.page_id = p.page_id ORDER BY c.id DESC")
+            campaigns = cursor.fetchall()
 
     pages_options = '<option value="">-- Select a Facebook Page --</option>' + "".join([f'<option value="{p["page_id"]}">{p["page_name"]}</option>' for p in pages])
     
@@ -347,6 +364,7 @@ async def dashboard():
     campaigns_rows_html = ""
     for c in campaigns:
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
+        ctr = round((c["link_clicks"] / c["dms_sent"]) * 100, 1) if c["dms_sent"] > 0 else 0
         
         actions = f"""
         <div class="flex items-center justify-end gap-3">
@@ -364,6 +382,8 @@ async def dashboard():
             <td class="py-4 px-4 font-mono font-bold text-blue-600 truncate max-w-[100px]" title="{c["post_id"]}">{c["post_id"]}</td>
             <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px] break-all">{c["trigger_keywords"]}</span></td>
             <td class="py-4 px-4 text-center font-bold text-slate-800">{c["dms_sent"]}</td>
+            <td class="py-4 px-4 text-center font-bold text-blue-600">{c["link_clicks"]}</td>
+            <td class="py-4 px-4 text-center font-bold text-emerald-600">{ctr}%</td>
             <td class="py-4 px-4 text-center">{status}</td>
             <td class="py-4 px-4 text-right">{actions}</td>
         </tr>
@@ -414,10 +434,12 @@ async def dashboard():
                                 <tr class="bg-gray-50/70 border-b border-gray-100 text-[10px] font-extrabold text-gray-400 uppercase tracking-wider">
                                     <th class="py-3 px-4">Campaign</th><th class="py-3 px-4">Target Post</th><th class="py-3 px-4">Keywords</th>
                                     <th class="py-3 px-4 text-center">Sent</th>
+                                    <th class="py-3 px-4 text-center">Clicks</th>
+                                    <th class="py-3 px-4 text-center">CTR</th>
                                     <th class="py-3 px-4 text-center">Status</th><th class="py-3 px-4 text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="6" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
+                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="8" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
                         </table>
                     </div>
                 </div>
@@ -446,7 +468,7 @@ async def dashboard():
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Puzzle Rule" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words (Use * for all)</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message Text (Use <code>{{{{first_name}}}}</code>)</label>
@@ -470,7 +492,7 @@ async def dashboard():
                     <input type="hidden" name="campaign_id" id="edit_campaign_id">
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" id="edit_campaign_name" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words (Use * for all)</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <div>
                         <label class="block font-bold text-gray-600 mb-1">DM Message Text</label>
@@ -555,26 +577,38 @@ async def dashboard():
 async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                ON CONFLICT (page_id, post_id) DO UPDATE SET 
+                campaign_name = EXCLUDED.campaign_name,
+                trigger_keywords = EXCLUDED.trigger_keywords,
+                dm_text = EXCLUDED.dm_text,
+                button_text = EXCLUDED.button_text,
+                button_url = EXCLUDED.button_url,
+                is_active = 1
+            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/edit-campaign")
 async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
     with get_db() as conn:
-        conn.execute("""
-            UPDATE campaigns 
-            SET campaign_name = ?, trigger_keywords = ?, dm_text = ?, button_text = ?, button_url = ?
-            WHERE id = ?
-        """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE campaigns 
+                SET campaign_name = %s, trigger_keywords = %s, dm_text = %s, button_text = %s, button_url = %s
+                WHERE id = %s
+            """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/delete-campaign")
 async def delete_campaign(campaign_id: int = Form(...)):
     with get_db() as conn:
-        conn.execute("DELETE FROM campaigns WHERE id = ?", (campaign_id,))
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))
         conn.commit()
     return RedirectResponse(url="/", status_code=303)
 

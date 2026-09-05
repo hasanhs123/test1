@@ -22,7 +22,7 @@ VERIFY_TOKEN = "hasan1235"
 
 # Grabs the database URL you put in Render's Environment Variables
 DB_URL = os.environ.get("DATABASE_URL")
-MAX_PER_HOUR = 500
+MAX_PER_HOUR = 700
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
@@ -66,6 +66,7 @@ def init_db():
                     button_text TEXT NOT NULL,
                     button_url TEXT NOT NULL,
                     dms_sent INTEGER DEFAULT 0,
+                    dms_opened INTEGER DEFAULT 0,
                     link_clicks INTEGER DEFAULT 0,
                     is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -73,12 +74,16 @@ def init_db():
                     UNIQUE(page_id, post_id)
                 )
             """)
+            # Safe migration check for existing tables without dms_opened column
+            cursor.execute("""
+                ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0;
+            """)
         conn.commit()
 
 init_db()
 
 # =========================================================
-# 2. UPTIME KEEP-ALIVE ROUTE (NEW)
+# 2. UPTIME KEEP-ALIVE ROUTE
 # =========================================================
 @app.get("/ping")
 async def keep_alive():
@@ -201,7 +206,8 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
-            delay = random.randint(30, 45)
+            # Updated delay to 20-30 seconds
+            delay = random.randint(20, 30)
             print(f"🎯 MATCH FOUND! Waiting {delay} seconds before sending DM to {sender_name}...")
             await asyncio.sleep(delay)
 
@@ -279,7 +285,10 @@ async def handle_webhook(request: Request):
                     if "read" in msg_event:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
+                                # Increment page-level opens
                                 cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
+                                # Increment campaign-level opens for active campaigns on this page
+                                cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE page_id = %s AND is_active = 1", (page_id,))
                             conn.commit()
                             
             for change in entry.get("changes", []):
@@ -355,7 +364,7 @@ async def dashboard():
             <div class="text-right flex items-center gap-4">
                 <div>
                     <span class="text-[9px] font-extrabold uppercase tracking-wider text-gray-400 block">Sent / Hour</span>
-                    <span class="font-extrabold text-sm text-green-600">{tracker["count"]} / 500</span>
+                    <span class="font-extrabold text-sm text-green-600">{tracker["count"]} / 700</span>
                 </div>
             </div>
         </div>
@@ -382,7 +391,8 @@ async def dashboard():
             <td class="py-4 px-4 font-mono font-bold text-blue-600 truncate max-w-[100px]" title="{c["post_id"]}">{c["post_id"]}</td>
             <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px] break-all">{c["trigger_keywords"]}</span></td>
             <td class="py-4 px-4 text-center font-bold text-slate-800">{c["dms_sent"]}</td>
-            <td class="py-4 px-4 text-center font-bold text-blue-600">{c["link_clicks"]}</td>
+            <td class="py-4 px-4 text-center font-bold text-blue-600">{c["dms_opened"]}</td>
+            <td class="py-4 px-4 text-center font-bold text-purple-600">{c["link_clicks"]}</td>
             <td class="py-4 px-4 text-center font-bold text-emerald-600">{ctr}%</td>
             <td class="py-4 px-4 text-center">{status}</td>
             <td class="py-4 px-4 text-right">{actions}</td>
@@ -432,14 +442,18 @@ async def dashboard():
                         <table class="w-full text-left border-collapse">
                             <thead>
                                 <tr class="bg-gray-50/70 border-b border-gray-100 text-[10px] font-extrabold text-gray-400 uppercase tracking-wider">
-                                    <th class="py-3 px-4">Campaign</th><th class="py-3 px-4">Target Post</th><th class="py-3 px-4">Keywords</th>
+                                    <th class="py-3 px-4">Campaign</th>
+                                    <th class="py-3 px-4">Target Post</th>
+                                    <th class="py-3 px-4">Keywords</th>
                                     <th class="py-3 px-4 text-center">Sent</th>
+                                    <th class="py-3 px-4 text-center">Opened</th>
                                     <th class="py-3 px-4 text-center">Clicks</th>
                                     <th class="py-3 px-4 text-center">CTR</th>
-                                    <th class="py-3 px-4 text-center">Status</th><th class="py-3 px-4 text-right">Actions</th>
+                                    <th class="py-3 px-4 text-center">Status</th>
+                                    <th class="py-3 px-4 text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="8" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
+                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="9" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
                         </table>
                     </div>
                 </div>

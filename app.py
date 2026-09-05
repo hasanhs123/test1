@@ -5,9 +5,11 @@ import time
 import httpx
 import psycopg2
 import psycopg2.extras
+import secrets
 from typing import Optional
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 
 app = FastAPI(title="Comment To DM Engine")
@@ -20,7 +22,27 @@ FB_APP_SECRET = "44b48575462c74e05dc2dae3b7c74886"
 VERIFY_TOKEN = "hasan1235"
 # =========================================================
 
-# Grabs the database URL you put in Render's Environment Variables
+# =========================================================
+# 🔒 DASHBOARD SECURITY (ADMIN LOGIN)
+# =========================================================
+security = HTTPBasic()
+
+# Change these to your own secret login details!
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "aazzxxcc321@"
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized Access",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
+# =========================================================
+
 DB_URL = os.environ.get("DATABASE_URL")
 MAX_PER_HOUR = 700
 message_queue = asyncio.Queue()
@@ -74,7 +96,6 @@ def init_db():
                     UNIQUE(page_id, post_id)
                 )
             """)
-            # Safe migration check for existing tables without dms_opened column
             cursor.execute("""
                 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0;
             """)
@@ -93,7 +114,7 @@ async def keep_alive():
 # 3. FACEBOOK OAUTH LOGIN
 # =========================================================
 @app.get("/auth/facebook")
-async def auth_facebook(request: Request):
+async def auth_facebook(request: Request, credentials: HTTPBasicCredentials = Depends(verify_admin)):
     redirect_uri = get_base_url(request) + "/auth/callback"
     scopes = "pages_show_list,pages_read_engagement,pages_manage_posts,pages_messaging,pages_manage_metadata"
     auth_url = f"https://www.facebook.com/v19.0/dialog/oauth?client_id={FB_APP_ID}&redirect_uri={redirect_uri}&scope={scopes}"
@@ -127,9 +148,10 @@ async def auth_callback(request: Request, code: str = None):
             with conn.cursor() as cursor:
                 for page in pages_data:
                     try:
+                        # 🔴 ADDED message_reads TO THE SUBSCRIPTION
                         sub_res = await client.post(
                             f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
-                            params={"access_token": page["access_token"], "subscribed_fields": "feed,messages"}
+                            params={"access_token": page["access_token"], "subscribed_fields": "feed,messages,message_reads"}
                         )
                         print(f"🔗 Page Subscription Result for {page['name']}: {sub_res.status_code} - {sub_res.text}")
                     except Exception as e:
@@ -147,7 +169,7 @@ async def auth_callback(request: Request, code: str = None):
     return RedirectResponse("/")
 
 # =========================================================
-# 4. LINK CLICK TRACKER
+# 4. LINK CLICK TRACKER (Unprotected so public users can click)
 # =========================================================
 @app.get("/click/{campaign_id}")
 async def track_link_click(campaign_id: int):
@@ -167,7 +189,7 @@ async def track_link_click(campaign_id: int):
 # 5. DYNAMIC POST FETCHER
 # =========================================================
 @app.get("/api/posts/{page_id}")
-async def get_page_posts(page_id: str):
+async def get_page_posts(page_id: str, credentials: HTTPBasicCredentials = Depends(verify_admin)):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT access_token FROM pages WHERE page_id = %s", (page_id,))
@@ -206,7 +228,6 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
-            # Updated delay to 20-30 seconds
             delay = random.randint(20, 30)
             print(f"🎯 MATCH FOUND! Waiting {delay} seconds before sending DM to {sender_name}...")
             await asyncio.sleep(delay)
@@ -285,9 +306,7 @@ async def handle_webhook(request: Request):
                     if "read" in msg_event:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
-                                # Increment page-level opens
                                 cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
-                                # Increment campaign-level opens for active campaigns on this page
                                 cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE page_id = %s AND is_active = 1", (page_id,))
                             conn.commit()
                             
@@ -341,7 +360,7 @@ async def handle_webhook(request: Request):
 # 8. DASHBOARD UI
 # =========================================================
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
+async def dashboard(credentials: HTTPBasicCredentials = Depends(verify_admin)):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM pages ORDER BY created_at DESC")
@@ -588,7 +607,16 @@ async def dashboard():
     return HTMLResponse(html)
 
 @app.post("/add-campaign")
-async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...), post_id: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
+async def add_campaign(
+    credentials: HTTPBasicCredentials = Depends(verify_admin),
+    page_id: str = Form(...), 
+    campaign_name: str = Form(...), 
+    post_id: str = Form(...), 
+    trigger_keywords: str = Form(...), 
+    dm_text: str = Form(...), 
+    button_text: str = Form(""), 
+    button_url: str = Form("")
+):
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
     with get_db() as conn:
         with conn.cursor() as cursor:
@@ -607,7 +635,15 @@ async def add_campaign(page_id: str = Form(...), campaign_name: str = Form(...),
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/edit-campaign")
-async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(...), trigger_keywords: str = Form(...), dm_text: str = Form(...), button_text: str = Form(""), button_url: str = Form("")):
+async def edit_campaign(
+    credentials: HTTPBasicCredentials = Depends(verify_admin),
+    campaign_id: int = Form(...), 
+    campaign_name: str = Form(...), 
+    trigger_keywords: str = Form(...), 
+    dm_text: str = Form(...), 
+    button_text: str = Form(""), 
+    button_url: str = Form("")
+):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
@@ -619,7 +655,10 @@ async def edit_campaign(campaign_id: int = Form(...), campaign_name: str = Form(
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/delete-campaign")
-async def delete_campaign(campaign_id: int = Form(...)):
+async def delete_campaign(
+    credentials: HTTPBasicCredentials = Depends(verify_admin),
+    campaign_id: int = Form(...)
+):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))

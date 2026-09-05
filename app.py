@@ -29,7 +29,7 @@ security = HTTPBasic()
 
 # Change these to your own secret login details!
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "aazzxxcc321@"
+ADMIN_PASSWORD = "password123"
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
@@ -47,6 +47,72 @@ DB_URL = os.environ.get("DATABASE_URL")
 MAX_PER_HOUR = 700
 message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
+
+# =========================================================
+# 📝 RANDOMIZED UNIQUE COMMENT ENGINE
+# =========================================================
+PUBLIC_REPLIES_MASTER = [
+    "Answer locked in! Follow for more.",
+    "Thanks for guessing! Share to test a friend.",
+    "Interesting take! Follow for daily puzzles.",
+    "Love the participation! Tag a smart buddy.",
+    "Guess received! Hit follow to play daily.",
+    "Let's see if that's it! Share this post.",
+    "Appreciate the comment! Follow to train your brain.",
+    "Answer noted! Challenge a friend to try.",
+    "Thanks for playing! Follow so you don't miss out.",
+    "Good effort! Share if you love brain teasers.",
+    "We have your answer! Hit follow for tomorrow's trivia.",
+    "Fascinating guess! Tag someone who loves puzzles.",
+    "Let's see how you did! Follow for more.",
+    "Response recorded! Share to trick your friends.",
+    "Love to see it! Follow us for daily challenges.",
+    "That's one way to look at it! Tag a friend.",
+    "Guess is in! Hit follow to keep playing.",
+    "Thanks for joining in! Share with your family.",
+    "Let's check that answer! Follow for more riddles.",
+    "Got your response! Challenge someone today.",
+    "Answer logged! Make sure to follow the page.",
+    "Interesting thought! Share this brain teaser.",
+    "Thanks for your guess! Tag someone to compete.",
+    "We see your answer! Follow for daily questions.",
+    "Let's find out! Share if you love trivia.",
+    "Great to have you playing! Hit follow.",
+    "Response locked! Challenge a coworker to solve this.",
+    "Appreciate the try! Follow for tomorrow's brain buster.",
+    "Guess noted! Share to stump the internet.",
+    "Thanks for participating! Tag a friend to play.",
+    "Answer is in! Follow to keep your mind sharp.",
+    "Let's see if you cracked it! Share this post.",
+    "Love the engagement! Follow us for more.",
+    "Your guess is safe with us! Tag a puzzle lover.",
+    "Thanks for commenting! Hit follow for the next one.",
+    "Response received! Challenge a friend to beat you.",
+    "We got it! Share if this made you think.",
+    "Guess confirmed! Follow for daily Q&A.",
+    "Let's see what happens! Tag someone smart.",
+    "Answer submitted! Follow so you never miss a puzzle.",
+    "Appreciate you playing! Share with your group chat.",
+    "Got it! Hit follow for more brain training.",
+    "Let's see if you're right! Challenge a buddy.",
+    "Thanks for dropping an answer! Follow us.",
+    "Response locked and loaded! Tag a friend.",
+    "We see you! Share this if you love a challenge.",
+    "Answer received loud and clear! Hit follow.",
+    "Thanks for the guess! Follow for the next puzzle.",
+    "Interesting answer! Tag a friend to see theirs.",
+    "Guess is officially in! Share to test others."
+]
+
+AVAILABLE_REPLIES = []
+
+def get_unique_reply():
+    global AVAILABLE_REPLIES
+    if not AVAILABLE_REPLIES:
+        AVAILABLE_REPLIES = PUBLIC_REPLIES_MASTER.copy()
+        random.shuffle(AVAILABLE_REPLIES)
+    return AVAILABLE_REPLIES.pop()
+# =========================================================
 
 def get_base_url(request: Request):
     host = request.headers.get("x-forwarded-host", request.url.netloc)
@@ -148,7 +214,6 @@ async def auth_callback(request: Request, code: str = None):
             with conn.cursor() as cursor:
                 for page in pages_data:
                     try:
-                        # 🔴 ADDED message_reads TO THE SUBSCRIPTION
                         sub_res = await client.post(
                             f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
                             params={"access_token": page["access_token"], "subscribed_fields": "feed,messages,message_reads"}
@@ -169,7 +234,7 @@ async def auth_callback(request: Request, code: str = None):
     return RedirectResponse("/")
 
 # =========================================================
-# 4. LINK CLICK TRACKER (Unprotected so public users can click)
+# 4. LINK CLICK TRACKER
 # =========================================================
 @app.get("/click/{campaign_id}")
 async def track_link_click(campaign_id: int):
@@ -204,10 +269,10 @@ async def get_page_posts(page_id: str, credentials: HTTPBasicCredentials = Depen
         return res.json()
 
 # =========================================================
-# 6. ASYNC BACKGROUND WORKER
+# 6. ASYNC BACKGROUND WORKER (HUMAN-DELAY & SHUFFLE REPLIES)
 # =========================================================
 async def process_queue():
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
             job = await message_queue.get()
             page_id = job["page_id"]
@@ -228,9 +293,23 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
-            delay = random.randint(20, 30)
-            print(f"🎯 MATCH FOUND! Waiting {delay} seconds before sending DM to {sender_name}...")
-            await asyncio.sleep(delay)
+            # DELAY 1: Wait 5-10 seconds before public reply
+            delay_public = random.randint(5, 10)
+            print(f"🎯 MATCH FOUND! Waiting {delay_public} seconds before public reply to {sender_name}...")
+            await asyncio.sleep(delay_public)
+            
+            try:
+                # Fetch a guaranteed unique comment from the shuffle deck
+                reply_text = get_unique_reply()
+                reply_url = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
+                await client.post(reply_url, json={"message": reply_text}, params={"access_token": token})
+            except Exception as e:
+                print(f"❌ ERROR REPLYING TO COMMENT: {e}")
+
+            # DELAY 2: Wait another 10-20 seconds before sliding into the DMs
+            delay_dm = random.randint(10, 20)
+            print(f"⏳ Public reply sent! Waiting {delay_dm} seconds before sending DM to {sender_name}...")
+            await asyncio.sleep(delay_dm)
 
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"

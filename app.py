@@ -49,69 +49,69 @@ message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
 # =========================================================
-# 📝 RANDOMIZED UNIQUE COMMENT ENGINE
+# 📝 RANDOMIZED UNIQUE COMMENT ENGINE (CORRECT & WRONG)
 # =========================================================
-PUBLIC_REPLIES_MASTER = [
-    "Answer locked in! Follow for more.",
-    "Thanks for guessing! Share to test a friend.",
-    "Interesting take! Follow for daily puzzles.",
-    "Love the participation! Tag a smart buddy.",
-    "Guess received! Hit follow to play daily.",
-    "Let's see if that's it! Share this post.",
-    "Appreciate the comment! Follow to train your brain.",
-    "Answer noted! Challenge a friend to try.",
-    "Thanks for playing! Follow so you don't miss out.",
-    "Good effort! Share if you love brain teasers.",
-    "We have your answer! Hit follow for tomorrow's trivia.",
-    "Fascinating guess! Tag someone who loves puzzles.",
-    "Let's see how you did! Follow for more.",
-    "Response recorded! Share to trick your friends.",
-    "Love to see it! Follow us for daily challenges.",
-    "That's one way to look at it! Tag a friend.",
-    "Guess is in! Hit follow to keep playing.",
-    "Thanks for joining in! Share with your family.",
-    "Let's check that answer! Follow for more riddles.",
-    "Got your response! Challenge someone today.",
-    "Answer logged! Make sure to follow the page.",
-    "Interesting thought! Share this brain teaser.",
-    "Thanks for your guess! Tag someone to compete.",
-    "We see your answer! Follow for daily questions.",
-    "Let's find out! Share if you love trivia.",
-    "Great to have you playing! Hit follow.",
-    "Response locked! Challenge a coworker to solve this.",
-    "Appreciate the try! Follow for tomorrow's brain buster.",
-    "Guess noted! Share to stump the internet.",
-    "Thanks for participating! Tag a friend to play.",
-    "Answer is in! Follow to keep your mind sharp.",
-    "Let's see if you cracked it! Share this post.",
-    "Love the engagement! Follow us for more.",
-    "Your guess is safe with us! Tag a puzzle lover.",
-    "Thanks for commenting! Hit follow for the next one.",
-    "Response received! Challenge a friend to beat you.",
-    "We got it! Share if this made you think.",
-    "Guess confirmed! Follow for daily Q&A.",
-    "Let's see what happens! Tag someone smart.",
-    "Answer submitted! Follow so you never miss a puzzle.",
-    "Appreciate you playing! Share with your group chat.",
-    "Got it! Hit follow for more brain training.",
-    "Let's see if you're right! Challenge a buddy.",
-    "Thanks for dropping an answer! Follow us.",
-    "Response locked and loaded! Tag a friend.",
-    "We see you! Share this if you love a challenge.",
-    "Answer received loud and clear! Hit follow.",
-    "Thanks for the guess! Follow for the next puzzle.",
-    "Interesting answer! Tag a friend to see theirs.",
-    "Guess is officially in! Share to test others."
+CORRECT_REPLIES_MASTER = [
+    "Correct! Tag a friend to see if they know it.", "Spot on! Share this puzzle to test others.",
+    "You nailed it! Hit follow for daily challenges.", "Perfect answer! Challenge your smart friends.",
+    "Exactly! See if your friends can solve this.", "Right answer! Share to trick someone else.",
+    "100% correct! Tag a genius buddy.", "Brilliant! Follow for more brain busters.",
+    "Nailed it! Pass this challenge to a friend.", "Spot on logic! Share if you love trivia.",
+    "Yes! Challenge someone to match your speed.", "Right on the money! Follow for daily puzzles.",
+    "You got it! Tag a friend who loves riddles.", "Absolute perfection! Share to test your group.",
+    "Correct answer! Hit follow to play tomorrow.", "Bingo! Tag someone to test their brain.",
+    "Genius level! Share this with your smart friends.", "That is it! Follow us for more.",
+    "Exactly right! Tag a friend to compete.", "Perfect! Share to see who else gets it.",
+    "Right on! Follow for the next puzzle.", "You solved it! Challenge a coworker.",
+    "Correct! Share if you love a good challenge.", "Spot on! Hit follow to keep playing.",
+    "Nailed it! Tag someone who needs a brain workout.", "Yes! Share to stump the internet.",
+    "100% right! Follow us for daily trivia.", "Brilliant answer! Tag a trivia master.",
+    "Exactly! Share to challenge your family.", "Right! Follow so you don't miss tomorrow.",
+    "You got it right! Tag a puzzle lover.", "Perfect deduction! Share this post.",
+    "Correct! Hit follow for more brain training.", "Spot on answer! Challenge a friend.",
+    "Nailed the logic! Share to test others.", "Yes! Tag someone who can match you.",
+    "100% accurate! Follow for daily Q&A.", "Brilliant logic! Share with your group chat.",
+    "Exactly! Tag a buddy to try.", "Right on! Hit follow to play every day.",
+    "You solved it perfectly! Share this puzzle.", "Correct! Challenge your friends now.",
+    "Spot on! Follow us for more riddles.", "Nailed it! Tag a smart friend.",
+    "Yes, that's the one! Share this brain teaser.", "100% correct! Hit follow.",
+    "Brilliant! Tag someone to compete with.", "Exactly right! Share if you had fun.",
+    "Right answer! Follow for more.", "You got it! Test your friends next."
 ]
 
-AVAILABLE_REPLIES = []
+WRONG_REPLIES_MASTER = [
+    "Not quite! Tag a friend to help you out.", "Incorrect! Share this to get some hints.",
+    "Close, but no! Challenge a friend to try.", "Oops, that's wrong! Follow for more practice.",
+    "Not the answer! Tag a smart buddy for help.", "Try again! Share to see what others think.",
+    "Missed the mark! Test your friends instead.", "Not exactly! Hit follow and try tomorrow.",
+    "That's incorrect! Ask a friend for the answer.", "Almost! Share this puzzle to get a clue.",
+    "Wrong answer! Tag someone who might know.", "Nope! Follow us for daily brain training.",
+    "Not it! Share to see if anyone else gets it.", "Incorrect! Challenge a coworker to solve it.",
+    "Close but incorrect! Hit follow to keep trying.", "Oops! Tag a friend to crack this.",
+    "Not right! Share this challenge.", "Wrong! Follow for more brain busters.",
+    "Not quite it! Ask your smart friends.", "Incorrect guess! Share for help.",
+    "Nope! Tag a puzzle lover to assist.", "Wrong answer! Hit follow and try again later.",
+    "Not the right one! Share to test your family.", "Incorrect! Challenge someone else.",
+    "Missed it! Follow us for daily trivia.", "Not exactly! Tag a friend to solve it.",
+    "Wrong! Share to stump the internet.", "Nope, try again! Hit follow.",
+    "Incorrect! Ask your group chat.", "Not quite! Share if you love a challenge."
+]
 
-def get_unique_reply():
-    global AVAILABLE_REPLIES
-    if not AVAILABLE_REPLIES:
-        AVAILABLE_REPLIES = PUBLIC_REPLIES_MASTER.copy()
-        random.shuffle(AVAILABLE_REPLIES)
-    return AVAILABLE_REPLIES.pop()
+AVAILABLE_CORRECT = []
+AVAILABLE_WRONG = []
+
+def get_unique_reply(is_correct: bool):
+    global AVAILABLE_CORRECT, AVAILABLE_WRONG
+    if is_correct:
+        if not AVAILABLE_CORRECT:
+            AVAILABLE_CORRECT = CORRECT_REPLIES_MASTER.copy()
+            random.shuffle(AVAILABLE_CORRECT)
+        return AVAILABLE_CORRECT.pop()
+    else:
+        if not AVAILABLE_WRONG:
+            AVAILABLE_WRONG = WRONG_REPLIES_MASTER.copy()
+            random.shuffle(AVAILABLE_WRONG)
+        return AVAILABLE_WRONG.pop()
 # =========================================================
 
 def get_base_url(request: Request):
@@ -162,7 +162,6 @@ def init_db():
                     UNIQUE(page_id, post_id)
                 )
             """)
-            # ADDED: Table to secretly track which user is tied to which campaign for perfect Open Attribution
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dm_tracking (
                     user_id TEXT,
@@ -278,7 +277,7 @@ async def get_page_posts(page_id: str, credentials: HTTPBasicCredentials = Depen
         return res.json()
 
 # =========================================================
-# 6. ASYNC BACKGROUND WORKER 
+# 6. ASYNC BACKGROUND WORKER (PUBLIC REPLY + CONDITIONAL DM)
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -291,6 +290,7 @@ async def process_queue():
             campaign = job["campaign"]
             token = job["token"]
             base_url = job["base_url"]
+            is_correct = job["is_correct"]
 
             curr_time = time.time()
             if page_id not in RATE_LIMIT_TRACKER:
@@ -305,11 +305,11 @@ async def process_queue():
 
             # STEP 1: Wait 5-10 seconds before public reply
             delay_public = random.randint(5, 10)
-            print(f"🎯 MATCH FOUND! Waiting {delay_public}s before public reply to {sender_name}...")
+            print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
             await asyncio.sleep(delay_public)
             
             try:
-                reply_text = get_unique_reply()
+                reply_text = get_unique_reply(is_correct)
                 reply_url = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
                 res_reply = await client.post(
                     reply_url,
@@ -317,13 +317,20 @@ async def process_queue():
                     params={"access_token": token}
                 )
                 if res_reply.status_code == 200:
-                    print(f"✅ Public reply posted: \"{reply_text}\"")
+                    status_type = "CORRECT" if is_correct else "WRONG"
+                    print(f"✅ {status_type} Public reply posted: \"{reply_text}\"")
                 else:
                     print(f"❌ META API COMMENT ERROR ({res_reply.status_code}): {res_reply.text}")
             except Exception as e:
                 print(f"❌ NETWORK EXCEPTION POSTING REPLY: {e}")
 
-            # STEP 2: Wait another 10-20 seconds before sending DM
+            # STEP 2: Only send a DM if they answered correctly
+            if not is_correct:
+                print(f"⏭️ Answer was incorrect. Skipping DM for {sender_name}.")
+                message_queue.task_done()
+                continue
+
+            # STEP 3: Wait another 10-20 seconds before sending DM
             delay_dm = random.randint(10, 20)
             print(f"⏳ Waiting {delay_dm}s before sending DM to {sender_name}...")
             await asyncio.sleep(delay_dm)
@@ -365,7 +372,6 @@ async def process_queue():
                     with get_db() as conn:
                         with conn.cursor() as cursor:
                             cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
-                            # Insert mapping so we know which campaign sent the DM to this specific user
                             cursor.execute("""
                                 INSERT INTO dm_tracking (user_id, page_id, campaign_id) 
                                 VALUES (%s, %s, %s)
@@ -413,15 +419,11 @@ async def handle_webhook(request: Request):
                         if reader_id:
                             with get_db() as conn:
                                 with conn.cursor() as cursor:
-                                    # Update global total
                                     cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
-                                    # Look up the exact campaign for this user
                                     cursor.execute("SELECT campaign_id FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
                                     tracking_row = cursor.fetchone()
                                     if tracking_row:
-                                        # Only update the specific matched campaign
                                         cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE id = %s", (tracking_row["campaign_id"],))
-                                        # Delete tracking record so we don't double count if they open the chat again
                                         cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
                                 conn.commit()
                             
@@ -440,7 +442,6 @@ async def handle_webhook(request: Request):
                     raw_post_id = str(value.get("post_id", ""))
                     post_id = raw_post_id.split("_")[-1] if "_" in raw_post_id else raw_post_id
 
-                    # Prevent bot from self-triggering
                     if sender_id == page_id:
                         continue
 
@@ -461,13 +462,13 @@ async def handle_webhook(request: Request):
                                 keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
                                 is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
                                 
-                                if is_matched:
-                                    await message_queue.put({
-                                        "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
-                                        "sender_id": sender_id,
-                                        "token": page_row["access_token"], "campaign": dict(campaign_row),
-                                        "base_url": get_base_url(request)
-                                    })
+                                await message_queue.put({
+                                    "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
+                                    "sender_id": sender_id,
+                                    "token": page_row["access_token"], "campaign": dict(campaign_row),
+                                    "base_url": get_base_url(request),
+                                    "is_correct": is_matched
+                                })
     except Exception as e:
         print(f"❌ ERROR PROCESSING WEBHOOK LOGIC: {e}")
         

@@ -49,7 +49,7 @@ message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
 # =========================================================
-# 📝 RANDOMIZED UNIQUE COMMENT ENGINE (50 NEUTRAL REPLIES)
+# 📝 RANDOMIZED UNIQUE COMMENT ENGINE
 # =========================================================
 PUBLIC_REPLIES_MASTER = [
     "Answer locked in! Follow for more.",
@@ -162,6 +162,15 @@ def init_db():
                     UNIQUE(page_id, post_id)
                 )
             """)
+            # ADDED: Table to secretly track which user is tied to which campaign for perfect Open Attribution
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS dm_tracking (
+                    user_id TEXT,
+                    page_id TEXT,
+                    campaign_id INTEGER,
+                    PRIMARY KEY (user_id, page_id)
+                )
+            """)
             cursor.execute("""
                 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0;
             """)
@@ -269,7 +278,7 @@ async def get_page_posts(page_id: str, credentials: HTTPBasicCredentials = Depen
         return res.json()
 
 # =========================================================
-# 6. ASYNC BACKGROUND WORKER (PUBLIC REPLY + PRIVATE DM)
+# 6. ASYNC BACKGROUND WORKER 
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -278,6 +287,7 @@ async def process_queue():
             page_id = job["page_id"]
             comment_id = job["comment_id"]
             sender_name = job["sender_name"]
+            sender_id = job["sender_id"]
             campaign = job["campaign"]
             token = job["token"]
             base_url = job["base_url"]
@@ -355,6 +365,12 @@ async def process_queue():
                     with get_db() as conn:
                         with conn.cursor() as cursor:
                             cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
+                            # Insert mapping so we know which campaign sent the DM to this specific user
+                            cursor.execute("""
+                                INSERT INTO dm_tracking (user_id, page_id, campaign_id) 
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (user_id, page_id) DO UPDATE SET campaign_id = EXCLUDED.campaign_id
+                            """, (sender_id, page_id, campaign["id"]))
                         conn.commit()
                     print(f"✅ DM sent successfully to {sender_name}!")
                 else:
@@ -393,11 +409,21 @@ async def handle_webhook(request: Request):
             if "messaging" in entry:
                 for msg_event in entry.get("messaging", []):
                     if "read" in msg_event:
-                        with get_db() as conn:
-                            with conn.cursor() as cursor:
-                                cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
-                                cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE page_id = %s AND is_active = 1", (page_id,))
-                            conn.commit()
+                        reader_id = msg_event.get("sender", {}).get("id")
+                        if reader_id:
+                            with get_db() as conn:
+                                with conn.cursor() as cursor:
+                                    # Update global total
+                                    cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
+                                    # Look up the exact campaign for this user
+                                    cursor.execute("SELECT campaign_id FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
+                                    tracking_row = cursor.fetchone()
+                                    if tracking_row:
+                                        # Only update the specific matched campaign
+                                        cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE id = %s", (tracking_row["campaign_id"],))
+                                        # Delete tracking record so we don't double count if they open the chat again
+                                        cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
+                                conn.commit()
                             
             for change in entry.get("changes", []):
                 value = change.get("value", {})
@@ -438,6 +464,7 @@ async def handle_webhook(request: Request):
                                 if is_matched:
                                     await message_queue.put({
                                         "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
+                                        "sender_id": sender_id,
                                         "token": page_row["access_token"], "campaign": dict(campaign_row),
                                         "base_url": get_base_url(request)
                                     })

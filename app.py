@@ -23,8 +23,6 @@ VERIFY_TOKEN = "hasan1235"
 # =========================================================
 # 🔒 SECRET URL DASHBOARD SECURITY
 # =========================================================
-# Instead of a password, your dashboard is now hidden here:
-# Bookmark this link: https://test1-yqpu.onrender.com/earnflow-admin-7788
 SECRET_ADMIN_PATH = "/earnflow-admin-7788"
 # =========================================================
 
@@ -152,12 +150,17 @@ def init_db():
                     user_id TEXT,
                     page_id TEXT,
                     campaign_id INTEGER,
+                    is_opened BOOLEAN DEFAULT FALSE,
+                    sender_name TEXT DEFAULT '',
                     PRIMARY KEY (user_id, page_id)
                 )
             """)
-            cursor.execute("""
-                ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0;
-            """)
+            # Auto-upgrade existing databases with new 2-step funnel columns
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
+            cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0")
         conn.commit()
 
 init_db()
@@ -167,7 +170,6 @@ init_db()
 # =========================================================
 @app.get("/")
 async def root_blank():
-    # Strangers and Google scanners will just see a blank "Not Found" page
     return PlainTextResponse("Not Found", status_code=404)
 
 @app.get("/ping")
@@ -267,20 +269,19 @@ async def get_page_posts(page_id: str):
         return res.json()
 
 # =========================================================
-# 6. ASYNC BACKGROUND WORKER (PUBLIC REPLY + CONDITIONAL DM)
+# 6. ASYNC BACKGROUND WORKER (TWO-STEP FUNNEL ENGINE)
 # =========================================================
 async def process_queue():
     async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
             job = await message_queue.get()
+            job_type = job.get("job_type")
             page_id = job["page_id"]
-            comment_id = job["comment_id"]
-            sender_name = job["sender_name"]
             sender_id = job["sender_id"]
+            sender_name = job["sender_name"]
             campaign = job["campaign"]
             token = job["token"]
             base_url = job["base_url"]
-            is_correct = job["is_correct"]
 
             curr_time = time.time()
             if page_id not in RATE_LIMIT_TRACKER:
@@ -293,86 +294,120 @@ async def process_queue():
                 message_queue.task_done()
                 continue
 
-            # STEP 1: Wait 5-10 seconds before public reply
-            delay_public = random.randint(5, 10)
-            print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
-            await asyncio.sleep(delay_public)
-            
-            try:
-                reply_text = get_unique_reply(is_correct)
-                reply_url = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
-                res_reply = await client.post(
-                    reply_url,
-                    data={"message": reply_text},
-                    params={"access_token": token}
-                )
-                if res_reply.status_code == 200:
-                    status_type = "CORRECT" if is_correct else "WRONG"
-                    print(f"✅ {status_type} Public reply posted: \"{reply_text}\"")
-                else:
-                    print(f"❌ META API COMMENT ERROR ({res_reply.status_code}): {res_reply.text}")
-            except Exception as e:
-                print(f"❌ NETWORK EXCEPTION POSTING REPLY: {e}")
-
-            # STEP 2: Only send a DM if they answered correctly
-            if not is_correct:
-                print(f"⏭️ Answer was incorrect. Skipping DM for {sender_name}.")
-                message_queue.task_done()
-                continue
-
-            # STEP 3: Wait another 10-20 seconds before sending DM
-            delay_dm = random.randint(10, 20)
-            print(f"⏳ Waiting {delay_dm}s before sending DM to {sender_name}...")
-            await asyncio.sleep(delay_dm)
-
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
-            
-            personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
-            
-            if campaign.get("button_url"):
-                link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
-                tracking_url = f"{base_url}/click/{campaign['id']}"
+
+            # ---------------------------------------------------------
+            # JOB TYPE 1: INITIAL COMMENT -> SEND FIRST PLAIN TEXT DM
+            # ---------------------------------------------------------
+            if job_type == "comment_reply":
+                comment_id = job["comment_id"]
+                is_correct = job["is_correct"]
+
+                delay_public = random.randint(5, 10)
+                print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
+                await asyncio.sleep(delay_public)
                 
+                try:
+                    reply_text = get_unique_reply(is_correct)
+                    reply_url = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
+                    res_reply = await client.post(reply_url, data={"message": reply_text}, params={"access_token": token})
+                    if res_reply.status_code == 200:
+                        status_type = "CORRECT" if is_correct else "WRONG"
+                        print(f"✅ {status_type} Public reply posted: \"{reply_text}\"")
+                except Exception as e:
+                    print(f"❌ NETWORK EXCEPTION POSTING REPLY: {e}")
+
+                if not is_correct:
+                    print(f"⏭️ Answer incorrect. Skipping DM for {sender_name}.")
+                    message_queue.task_done()
+                    continue
+
+                delay_dm = random.randint(10, 20)
+                print(f"⏳ Waiting {delay_dm}s before sending INITIAL TEXT DM to {sender_name}...")
+                await asyncio.sleep(delay_dm)
+
+                first_dm_text = campaign.get("first_dm_text", "").replace("{first_name}", first_name).replace("{full_name}", full_name)
+                
+                # First message uses comment_id recipient parameter
                 payload = {
                     "recipient": {"comment_id": comment_id},
-                    "message": {
-                        "attachment": {
-                            "type": "template",
-                            "payload": {
-                                "template_type": "button",
-                                "text": personalized_text,
-                                "buttons": [{"type": "web_url", "url": tracking_url, "title": link_title}]
+                    "message": {"text": first_dm_text}
+                }
+                url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
+
+                try:
+                    res = await client.post(url, json=payload, params={"access_token": token})
+                    if res.status_code == 200:
+                        RATE_LIMIT_TRACKER[page_id]["count"] += 1
+                        with get_db() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
+                                # Save them to memory so we can catch their reply
+                                cursor.execute("""
+                                    INSERT INTO dm_tracking (user_id, page_id, campaign_id, is_opened, sender_name) 
+                                    VALUES (%s, %s, %s, FALSE, %s)
+                                    ON CONFLICT (user_id, page_id) DO UPDATE SET 
+                                    campaign_id = EXCLUDED.campaign_id,
+                                    is_opened = FALSE,
+                                    sender_name = EXCLUDED.sender_name
+                                """, (sender_id, page_id, campaign["id"], sender_name))
+                            conn.commit()
+                        print(f"✅ INITIAL DM sent to {sender_name}!")
+                except Exception as e:
+                    print(f"❌ ERROR SENDING INITIAL DM: {e}")
+
+            # ---------------------------------------------------------
+            # JOB TYPE 2: USER REPLIED -> SEND ACTUAL BUTTON DM
+            # ---------------------------------------------------------
+            elif job_type == "second_dm":
+                delay_second_dm = random.randint(5, 8)
+                print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
+                await asyncio.sleep(delay_second_dm)
+
+                personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
+                
+                if campaign.get("button_url"):
+                    tracking_url = f"{base_url}/click/{campaign['id']}"
+                    link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
+                    
+                    # 24-Hour window is open! We can safely use the Button Template.
+                    payload = {
+                        "recipient": {"id": sender_id},
+                        "message": {
+                            "attachment": {
+                                "type": "template",
+                                "payload": {
+                                    "template_type": "button",
+                                    "text": personalized_text,
+                                    "buttons": [{"type": "web_url", "url": tracking_url, "title": link_title}]
+                                }
                             }
                         }
                     }
-                }
-            else:
-                payload = {
-                    "recipient": {"comment_id": comment_id},
-                    "message": {"text": personalized_text}
-                }
-
-            url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
-
-            try:
-                res = await client.post(url, json=payload, params={"access_token": token})
-                if res.status_code == 200:
-                    RATE_LIMIT_TRACKER[page_id]["count"] += 1
-                    with get_db() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
-                            cursor.execute("""
-                                INSERT INTO dm_tracking (user_id, page_id, campaign_id) 
-                                VALUES (%s, %s, %s)
-                                ON CONFLICT (user_id, page_id) DO UPDATE SET campaign_id = EXCLUDED.campaign_id
-                            """, (sender_id, page_id, campaign["id"]))
-                        conn.commit()
-                    print(f"✅ DM sent successfully to {sender_name}!")
                 else:
-                    print(f"❌ META API DM ERROR ({res.status_code}): {res.text}")
-            except Exception as e:
-                print(f"❌ FATAL ERROR SENDING DM: {e}")
+                    payload = {
+                        "recipient": {"id": sender_id},
+                        "message": {"text": personalized_text}
+                    }
+
+                url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
+
+                try:
+                    res = await client.post(url, json=payload, params={"access_token": token})
+                    if res.status_code == 200:
+                        RATE_LIMIT_TRACKER[page_id]["count"] += 1
+                        with get_db() as conn:
+                            with conn.cursor() as cursor:
+                                # Delete from tracking so they don't re-trigger it endlessly
+                                cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
+                            conn.commit()
+                        print(f"✅ SECOND DM (Payload) sent successfully to {sender_name}!")
+                    else:
+                        print(f"❌ META API SECOND DM ERROR: {res.text}")
+                except Exception as e:
+                    print(f"❌ ERROR SENDING SECOND DM: {e}")
+
             message_queue.task_done()
 
 @app.on_event("startup")
@@ -402,21 +437,55 @@ async def handle_webhook(request: Request):
         for entry in data.get("entry", []):
             page_id = str(entry.get("id"))
             
+            # --- HANDLE INCOMING MESSAGES AND READS ---
             if "messaging" in entry:
                 for msg_event in entry.get("messaging", []):
+                    # HANDLE READ RECEIPTS
                     if "read" in msg_event:
                         reader_id = msg_event.get("sender", {}).get("id")
                         if reader_id:
                             with get_db() as conn:
                                 with conn.cursor() as cursor:
-                                    cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
-                                    cursor.execute("SELECT campaign_id FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
+                                    cursor.execute("SELECT campaign_id, is_opened FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
+                                    tracking_row = cursor.fetchone()
+                                    if tracking_row and not tracking_row["is_opened"]:
+                                        cursor.execute("UPDATE pages SET dms_opened = dms_opened + 1 WHERE page_id = %s", (page_id,))
+                                        cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE id = %s", (tracking_row["campaign_id"],))
+                                        cursor.execute("UPDATE dm_tracking SET is_opened = TRUE WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
+                                conn.commit()
+                                
+                    # HANDLE INCOMING TEXT MESSAGES (USER REPLY)
+                    elif "message" in msg_event and not msg_event.get("message", {}).get("is_echo"):
+                        sender_id = msg_event.get("sender", {}).get("id")
+                        message_text = msg_event.get("message", {}).get("text", "").lower()
+                        
+                        if sender_id and message_text:
+                            with get_db() as conn:
+                                with conn.cursor() as cursor:
+                                    cursor.execute("SELECT campaign_id, sender_name FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
                                     tracking_row = cursor.fetchone()
                                     if tracking_row:
-                                        cursor.execute("UPDATE campaigns SET dms_opened = dms_opened + 1 WHERE id = %s", (tracking_row["campaign_id"],))
-                                        cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
-                                conn.commit()
+                                        cursor.execute("SELECT * FROM campaigns WHERE id = %s AND is_active = 1", (tracking_row["campaign_id"],))
+                                        campaign = cursor.fetchone()
+                                        if campaign:
+                                            keywords = [k.strip().lower() for k in campaign["dm_trigger_keywords"].split(",") if k.strip()]
+                                            is_matched = any(kw in message_text for kw in keywords) if keywords != ["*"] else True
+                                            
+                                            if is_matched:
+                                                cursor.execute("SELECT access_token FROM pages WHERE page_id = %s", (page_id,))
+                                                page_row = cursor.fetchone()
+                                                if page_row:
+                                                    await message_queue.put({
+                                                        "job_type": "second_dm",
+                                                        "page_id": page_id,
+                                                        "sender_id": sender_id,
+                                                        "sender_name": tracking_row["sender_name"],
+                                                        "token": page_row["access_token"],
+                                                        "campaign": dict(campaign),
+                                                        "base_url": get_base_url(request)
+                                                    })
                             
+            # --- HANDLE INCOMING COMMENTS ---
             for change in entry.get("changes", []):
                 value = change.get("value", {})
                 
@@ -453,9 +522,13 @@ async def handle_webhook(request: Request):
                                 is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
                                 
                                 await message_queue.put({
-                                    "page_id": page_id, "comment_id": comment_id, "sender_name": sender_name,
+                                    "job_type": "comment_reply",
+                                    "page_id": page_id,
+                                    "comment_id": comment_id,
+                                    "sender_name": sender_name,
                                     "sender_id": sender_id,
-                                    "token": page_row["access_token"], "campaign": dict(campaign_row),
+                                    "token": page_row["access_token"],
+                                    "campaign": dict(campaign_row),
                                     "base_url": get_base_url(request),
                                     "is_correct": is_matched
                                 })
@@ -465,7 +538,7 @@ async def handle_webhook(request: Request):
     return PlainTextResponse("EVENT_RECEIVED", status_code=200)
 
 # =========================================================
-# 8. DASHBOARD UI (NOW ON SECRET URL)
+# 8. DASHBOARD UI
 # =========================================================
 @app.get(SECRET_ADMIN_PATH, response_class=HTMLResponse)
 async def dashboard():
@@ -502,9 +575,18 @@ async def dashboard():
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         ctr = round((c["link_clicks"] / c["dms_sent"]) * 100, 1) if c["dms_sent"] > 0 else 0
         
+        # Format strings safely for Javascript injection
+        safe_name = c['campaign_name'].replace("'", "\\'")
+        safe_kw = c['trigger_keywords'].replace("'", "\\'")
+        safe_first_dm = c.get('first_dm_text', '').replace("'", "\\'").replace("\n", "\\n")
+        safe_dm_trigger = c.get('dm_trigger_keywords', '').replace("'", "\\'")
+        safe_dm = c['dm_text'].replace("'", "\\'").replace("\n", "\\n")
+        safe_btn_txt = c['button_text'].replace("'", "\\'")
+        safe_btn_url = c['button_url'].replace("'", "\\'")
+
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, `{c['campaign_name']}`, `{c['trigger_keywords']}`, `{c['dm_text'].replace('`', '')}`, `{c['button_text']}`, `{c['button_url']}`)" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -609,14 +691,26 @@ async def dashboard():
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" required placeholder="e.g. Puzzle Rule" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words (Use * for all)</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Comment Trigger (Use * for all)</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
+                    
+                    <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
+                        <div>
+                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
+                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{first_name}}! Do you want to get $5000/month ebook guide?" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>
+                            <input type="text" name="dm_trigger_keywords" required placeholder="yes, sure, send it" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500">
+                        </div>
+                    </div>
+
                     <div>
-                        <label class="block font-bold text-gray-600 mb-1">DM Message Text (Use <code>{{{{first_name}}}}</code>)</label>
-                        <textarea name="dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! You got it right!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        <label class="block font-bold text-gray-600 mb-1">Step 3: Final DM Text (With Button)</label>
+                        <textarea name="dm_text" required rows="2" placeholder="Here is the link as promised!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
-                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Play Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
@@ -633,15 +727,27 @@ async def dashboard():
                     <input type="hidden" name="campaign_id" id="edit_campaign_id">
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" id="edit_campaign_name" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">Trigger Words (Use * for all)</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Comment Trigger (Use * for all)</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
+
+                    <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
+                        <div>
+                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
+                            <textarea name="first_dm_text" id="edit_first_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        </div>
+                        <div>
+                            <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>
+                            <input type="text" name="dm_trigger_keywords" id="edit_dm_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500">
+                        </div>
+                    </div>
+
                     <div>
-                        <label class="block font-bold text-gray-600 mb-1">DM Message Text</label>
+                        <label class="block font-bold text-gray-600 mb-1">Step 3: Final DM Text (With Button)</label>
                         <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
-                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" placeholder="e.g. Play Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" id="edit_button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" id="edit_button_url" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
                 </form>
@@ -661,10 +767,12 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, dm_text, btn_text, btn_url) {{
+            function editCampaign(id, name, keywords, first_dm, dm_trigger, dm_text, btn_text, btn_url) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
+                document.getElementById('edit_first_dm_text').value = first_dm;
+                document.getElementById('edit_dm_trigger_keywords').value = dm_trigger;
                 document.getElementById('edit_dm_text').value = dm_text;
                 document.getElementById('edit_button_text').value = btn_text;
                 document.getElementById('edit_button_url').value = btn_url;
@@ -720,6 +828,8 @@ async def add_campaign(
     campaign_name: str = Form(...), 
     post_id: str = Form(...), 
     trigger_keywords: str = Form(...), 
+    first_dm_text: str = Form(...),
+    dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
     button_text: str = Form(""), 
     button_url: str = Form("")
@@ -728,16 +838,18 @@ async def add_campaign(
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, dm_text, button_text, button_url, is_active) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, dm_trigger_keywords, dm_text, button_text, button_url, is_active) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
                 ON CONFLICT (page_id, post_id) DO UPDATE SET 
                 campaign_name = EXCLUDED.campaign_name,
                 trigger_keywords = EXCLUDED.trigger_keywords,
+                first_dm_text = EXCLUDED.first_dm_text,
+                dm_trigger_keywords = EXCLUDED.dm_trigger_keywords,
                 dm_text = EXCLUDED.dm_text,
                 button_text = EXCLUDED.button_text,
                 button_url = EXCLUDED.button_url,
                 is_active = 1
-            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
+            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 
@@ -746,6 +858,8 @@ async def edit_campaign(
     campaign_id: int = Form(...), 
     campaign_name: str = Form(...), 
     trigger_keywords: str = Form(...), 
+    first_dm_text: str = Form(...),
+    dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
     button_text: str = Form(""), 
     button_url: str = Form("")
@@ -754,9 +868,9 @@ async def edit_campaign(
         with conn.cursor() as cursor:
             cursor.execute("""
                 UPDATE campaigns 
-                SET campaign_name = %s, trigger_keywords = %s, dm_text = %s, button_text = %s, button_url = %s
+                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, dm_trigger_keywords = %s, dm_text = %s, button_text = %s, button_url = %s
                 WHERE id = %s
-            """, (campaign_name.strip(), trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
+            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 

@@ -32,7 +32,7 @@ message_queue = asyncio.Queue()
 RATE_LIMIT_TRACKER = {}
 
 # =========================================================
-# 📝 RANDOMIZED UNIQUE COMMENT ENGINE (CORRECT & WRONG)
+# 📝 RANDOMIZED UNIQUE COMMENT ENGINE
 # =========================================================
 CORRECT_REPLIES_MASTER = [
     "Correct! Tag a friend to see if they know it.", "Spot on! Share this puzzle to test others.",
@@ -326,10 +326,18 @@ async def process_queue():
                 print(f"⏳ Waiting {delay_dm}s before sending INITIAL TEXT DM to {sender_name}...")
                 await asyncio.sleep(delay_dm)
 
-                # Safely pull first_dm_text in case it's an old campaign
+                # Fallback in case the admin hasn't added initial DM text yet
                 raw_first_dm = campaign.get("first_dm_text") or ""
+                if not raw_first_dm.strip():
+                    print(f"⚠️ WARNING: Initial DM is empty! Using default fallback text.")
+                    raw_first_dm = "Hi {first_name}! You got it right! Are you ready for your reward? Reply YES to claim it."
+
                 first_dm_text = raw_first_dm.replace("{first_name}", first_name).replace("{full_name}", full_name)
                 
+                # Invisible Spintax to prevent Meta from blocking identical first DMs
+                invisible_space = "\u200B" * random.randint(1, 5)
+                first_dm_text = first_dm_text + invisible_space
+
                 payload = {
                     "recipient": {"comment_id": comment_id},
                     "message": {"text": first_dm_text}
@@ -353,6 +361,9 @@ async def process_queue():
                                 """, (sender_id, page_id, campaign["id"], sender_name))
                             conn.commit()
                         print(f"✅ INITIAL DM sent to {sender_name}!")
+                    else:
+                        # THE MISSING ERROR LOG IS NOW HERE
+                        print(f"❌ META API INITIAL DM ERROR ({res.status_code}): {res.text}")
                 except Exception as e:
                     print(f"❌ ERROR SENDING INITIAL DM: {e}")
 
@@ -367,6 +378,10 @@ async def process_queue():
                 raw_dm_text = campaign.get("dm_text") or ""
                 personalized_text = raw_dm_text.replace("{first_name}", first_name).replace("{full_name}", full_name)
                 
+                # Invisible Spintax for the second DM
+                invisible_space = "\u200B" * random.randint(1, 5)
+                personalized_text = personalized_text + invisible_space
+
                 if campaign.get("button_url"):
                     tracking_url = f"{base_url}/click/{campaign['id']}"
                     link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"

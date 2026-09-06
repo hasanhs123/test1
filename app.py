@@ -155,7 +155,6 @@ def init_db():
                     PRIMARY KEY (user_id, page_id)
                 )
             """)
-            # Auto-upgrade existing databases with new 2-step funnel columns
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
@@ -327,9 +326,10 @@ async def process_queue():
                 print(f"⏳ Waiting {delay_dm}s before sending INITIAL TEXT DM to {sender_name}...")
                 await asyncio.sleep(delay_dm)
 
-                first_dm_text = campaign.get("first_dm_text", "").replace("{first_name}", first_name).replace("{full_name}", full_name)
+                # Safely pull first_dm_text in case it's an old campaign
+                raw_first_dm = campaign.get("first_dm_text") or ""
+                first_dm_text = raw_first_dm.replace("{first_name}", first_name).replace("{full_name}", full_name)
                 
-                # First message uses comment_id recipient parameter
                 payload = {
                     "recipient": {"comment_id": comment_id},
                     "message": {"text": first_dm_text}
@@ -343,7 +343,6 @@ async def process_queue():
                         with get_db() as conn:
                             with conn.cursor() as cursor:
                                 cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
-                                # Save them to memory so we can catch their reply
                                 cursor.execute("""
                                     INSERT INTO dm_tracking (user_id, page_id, campaign_id, is_opened, sender_name) 
                                     VALUES (%s, %s, %s, FALSE, %s)
@@ -365,13 +364,13 @@ async def process_queue():
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
                 await asyncio.sleep(delay_second_dm)
 
-                personalized_text = campaign["dm_text"].replace("{first_name}", first_name).replace("{full_name}", full_name)
+                raw_dm_text = campaign.get("dm_text") or ""
+                personalized_text = raw_dm_text.replace("{first_name}", first_name).replace("{full_name}", full_name)
                 
                 if campaign.get("button_url"):
                     tracking_url = f"{base_url}/click/{campaign['id']}"
                     link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
                     
-                    # 24-Hour window is open! We can safely use the Button Template.
                     payload = {
                         "recipient": {"id": sender_id},
                         "message": {
@@ -399,7 +398,6 @@ async def process_queue():
                         RATE_LIMIT_TRACKER[page_id]["count"] += 1
                         with get_db() as conn:
                             with conn.cursor() as cursor:
-                                # Delete from tracking so they don't re-trigger it endlessly
                                 cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
                             conn.commit()
                         print(f"✅ SECOND DM (Payload) sent successfully to {sender_name}!")
@@ -468,8 +466,18 @@ async def handle_webhook(request: Request):
                                         cursor.execute("SELECT * FROM campaigns WHERE id = %s AND is_active = 1", (tracking_row["campaign_id"],))
                                         campaign = cursor.fetchone()
                                         if campaign:
-                                            keywords = [k.strip().lower() for k in campaign["dm_trigger_keywords"].split(",") if k.strip()]
-                                            is_matched = any(kw in message_text for kw in keywords) if keywords != ["*"] else True
+                                            # Safely check trigger keywords for old campaigns
+                                            raw_dm_trigger = campaign.get("dm_trigger_keywords") or ""
+                                            keywords = [k.strip().lower() for k in raw_dm_trigger.split(",") if k.strip()]
+                                            
+                                            # Match logic
+                                            is_matched = False
+                                            if not keywords:
+                                                is_matched = False
+                                            elif keywords == ["*"]:
+                                                is_matched = True
+                                            else:
+                                                is_matched = any(kw in message_text for kw in keywords)
                                             
                                             if is_matched:
                                                 cursor.execute("SELECT access_token FROM pages WHERE page_id = %s", (page_id,))
@@ -518,8 +526,16 @@ async def handle_webhook(request: Request):
                                 campaign_row = cursor.fetchone()
 
                             if campaign_row:
-                                keywords = [k.strip().lower() for k in campaign_row["trigger_keywords"].split(",") if k.strip()]
-                                is_matched = any(kw in comment_text for kw in keywords) if keywords != ["*"] else True
+                                raw_trigger_kw = campaign_row.get("trigger_keywords") or ""
+                                keywords = [k.strip().lower() for k in raw_trigger_kw.split(",") if k.strip()]
+                                
+                                is_matched = False
+                                if not keywords:
+                                    is_matched = False
+                                elif keywords == ["*"]:
+                                    is_matched = True
+                                else:
+                                    is_matched = any(kw in comment_text for kw in keywords)
                                 
                                 await message_queue.put({
                                     "job_type": "comment_reply",
@@ -542,6 +558,12 @@ async def handle_webhook(request: Request):
 # =========================================================
 @app.get(SECRET_ADMIN_PATH, response_class=HTMLResponse)
 async def dashboard():
+    # Helper to clean strings safely for Javascript attributes
+    def escape_val(v):
+        if not v:
+            return ""
+        return str(v).replace("\\", "\\\\").replace("'", "\\'").replace('"', '&quot;').replace("\n", "\\n").replace("\r", "")
+
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM pages ORDER BY created_at DESC")
@@ -575,14 +597,14 @@ async def dashboard():
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         ctr = round((c["link_clicks"] / c["dms_sent"]) * 100, 1) if c["dms_sent"] > 0 else 0
         
-        # Format strings safely for Javascript injection
-        safe_name = c['campaign_name'].replace("'", "\\'")
-        safe_kw = c['trigger_keywords'].replace("'", "\\'")
-        safe_first_dm = c.get('first_dm_text', '').replace("'", "\\'").replace("\n", "\\n")
-        safe_dm_trigger = c.get('dm_trigger_keywords', '').replace("'", "\\'")
-        safe_dm = c['dm_text'].replace("'", "\\'").replace("\n", "\\n")
-        safe_btn_txt = c['button_text'].replace("'", "\\'")
-        safe_btn_url = c['button_url'].replace("'", "\\'")
+        # Safely scrub all text before injecting it into HTML so it never breaks the Edit button
+        safe_name = escape_val(c.get('campaign_name'))
+        safe_kw = escape_val(c.get('trigger_keywords'))
+        safe_first_dm = escape_val(c.get('first_dm_text'))
+        safe_dm_trigger = escape_val(c.get('dm_trigger_keywords'))
+        safe_dm = escape_val(c.get('dm_text'))
+        safe_btn_txt = escape_val(c.get('button_text'))
+        safe_btn_url = escape_val(c.get('button_url'))
 
         actions = f"""
         <div class="flex items-center justify-end gap-3">
@@ -697,7 +719,7 @@ async def dashboard():
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
-                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{first_name}}! Do you want to get $5000/month ebook guide?" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get $5000/month ebook guide?" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                         </div>
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>

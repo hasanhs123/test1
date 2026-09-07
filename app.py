@@ -13,10 +13,10 @@ import uvicorn
 app = FastAPI(title="Comment To DM Engine")
 
 # =========================================================
-# 🔴 META APP CREDENTIALS
+# 🔴 META APP CREDENTIALS (SECURED)
 # =========================================================
-FB_APP_ID = "4540018746283778"
-FB_APP_SECRET = "44b48575462c74e05dc2dae3b7c74886"
+FB_APP_ID = os.environ.get("FB_APP_ID")
+FB_APP_SECRET = os.environ.get("FB_APP_SECRET")
 VERIFY_TOKEN = "hasan1235"
 # =========================================================
 
@@ -165,7 +165,7 @@ def init_db():
 init_db()
 
 # =========================================================
-# 2. PUBLIC BLANK PAGE (TO FOOL SCANNERS)
+# 2. PUBLIC BLANK PAGE
 # =========================================================
 @app.get("/")
 async def root_blank():
@@ -182,7 +182,7 @@ async def keep_alive():
 async def auth_facebook(request: Request):
     redirect_uri = get_base_url(request) + "/auth/callback"
     scopes = "pages_show_list,pages_read_engagement,pages_manage_engagement,pages_manage_posts,pages_messaging,pages_manage_metadata"
-    auth_url = f"https://www.facebook.com/v19.0/dialog/oauth?client_id={FB_APP_ID}&redirect_uri={redirect_uri}&scope={scopes}"
+    auth_url = f"https://www.facebook.com/v21.0/dialog/oauth?client_id={FB_APP_ID}&redirect_uri={redirect_uri}&scope={scopes}"
     return RedirectResponse(auth_url)
 
 @app.get("/auth/callback")
@@ -193,7 +193,7 @@ async def auth_callback(request: Request, code: str = None):
     redirect_uri = get_base_url(request) + "/auth/callback"
     
     async with httpx.AsyncClient() as client:
-        token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
+        token_url = "https://graph.facebook.com/v21.0/oauth/access_token"
         res = await client.get(token_url, params={
             "client_id": FB_APP_ID,
             "redirect_uri": redirect_uri,
@@ -205,7 +205,7 @@ async def auth_callback(request: Request, code: str = None):
         if not user_token:
             return HTMLResponse(f"Failed to get token: {res.text}")
 
-        pages_url = "https://graph.facebook.com/v19.0/me/accounts"
+        pages_url = "https://graph.facebook.com/v21.0/me/accounts"
         pages_res = await client.get(pages_url, params={"access_token": user_token})
         pages_data = pages_res.json().get("data", [])
 
@@ -214,7 +214,7 @@ async def auth_callback(request: Request, code: str = None):
                 for page in pages_data:
                     try:
                         sub_res = await client.post(
-                            f"https://graph.facebook.com/v19.0/{page['id']}/subscribed_apps",
+                            f"https://graph.facebook.com/v21.0/{page['id']}/subscribed_apps",
                             params={"access_token": page["access_token"], "subscribed_fields": "feed,messages,message_reads"}
                         )
                         print(f"🔗 Page Subscription Result for {page['name']}: {sub_res.status_code} - {sub_res.text}")
@@ -263,7 +263,7 @@ async def get_page_posts(page_id: str):
             access_token = row["access_token"]
     
     async with httpx.AsyncClient() as client:
-        url = f"https://graph.facebook.com/v19.0/{page_id}/published_posts"
+        url = f"https://graph.facebook.com/v21.0/{page_id}/published_posts"
         res = await client.get(url, params={"fields": "id,message,created_time,full_picture", "access_token": access_token, "limit": 15})
         return res.json()
 
@@ -296,9 +296,6 @@ async def process_queue():
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
 
-            # ---------------------------------------------------------
-            # JOB TYPE 1: INITIAL COMMENT -> SEND FIRST PLAIN TEXT DM
-            # ---------------------------------------------------------
             if job_type == "comment_reply":
                 comment_id = job["comment_id"]
                 is_correct = job["is_correct"]
@@ -309,7 +306,7 @@ async def process_queue():
                 
                 try:
                     reply_text = get_unique_reply(is_correct)
-                    reply_url = f"https://graph.facebook.com/v19.0/{comment_id}/comments"
+                    reply_url = f"https://graph.facebook.com/v21.0/{comment_id}/comments"
                     res_reply = await client.post(reply_url, data={"message": reply_text}, params={"access_token": token})
                     if res_reply.status_code == 200:
                         status_type = "CORRECT" if is_correct else "WRONG"
@@ -326,15 +323,12 @@ async def process_queue():
                 print(f"⏳ Waiting {delay_dm}s before sending INITIAL TEXT DM to {sender_name}...")
                 await asyncio.sleep(delay_dm)
 
-                # Fallback in case the admin hasn't added initial DM text yet
                 raw_first_dm = campaign.get("first_dm_text") or ""
                 if not raw_first_dm.strip():
                     print(f"⚠️ WARNING: Initial DM is empty! Using default fallback text.")
                     raw_first_dm = "Hi {first_name}! You got it right! Are you ready for your reward? Reply YES to claim it."
 
                 first_dm_text = raw_first_dm.replace("{first_name}", first_name).replace("{full_name}", full_name)
-                
-                # Invisible Spintax to prevent Meta from blocking identical first DMs
                 invisible_space = "\u200B" * random.randint(1, 5)
                 first_dm_text = first_dm_text + invisible_space
 
@@ -342,7 +336,7 @@ async def process_queue():
                     "recipient": {"comment_id": comment_id},
                     "message": {"text": first_dm_text}
                 }
-                url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
+                url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
 
                 try:
                     res = await client.post(url, json=payload, params={"access_token": token})
@@ -362,14 +356,10 @@ async def process_queue():
                             conn.commit()
                         print(f"✅ INITIAL DM sent to {sender_name}!")
                     else:
-                        # THE MISSING ERROR LOG IS NOW HERE
                         print(f"❌ META API INITIAL DM ERROR ({res.status_code}): {res.text}")
                 except Exception as e:
                     print(f"❌ ERROR SENDING INITIAL DM: {e}")
 
-            # ---------------------------------------------------------
-            # JOB TYPE 2: USER REPLIED -> SEND ACTUAL BUTTON DM
-            # ---------------------------------------------------------
             elif job_type == "second_dm":
                 delay_second_dm = random.randint(5, 8)
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
@@ -377,8 +367,6 @@ async def process_queue():
 
                 raw_dm_text = campaign.get("dm_text") or ""
                 personalized_text = raw_dm_text.replace("{first_name}", first_name).replace("{full_name}", full_name)
-                
-                # Invisible Spintax for the second DM
                 invisible_space = "\u200B" * random.randint(1, 5)
                 personalized_text = personalized_text + invisible_space
 
@@ -405,7 +393,7 @@ async def process_queue():
                         "message": {"text": personalized_text}
                     }
 
-                url = f"https://graph.facebook.com/v19.0/{page_id}/messages"
+                url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
 
                 try:
                     res = await client.post(url, json=payload, params={"access_token": token})
@@ -450,10 +438,8 @@ async def handle_webhook(request: Request):
         for entry in data.get("entry", []):
             page_id = str(entry.get("id"))
             
-            # --- HANDLE INCOMING MESSAGES AND READS ---
             if "messaging" in entry:
                 for msg_event in entry.get("messaging", []):
-                    # HANDLE READ RECEIPTS
                     if "read" in msg_event:
                         reader_id = msg_event.get("sender", {}).get("id")
                         if reader_id:
@@ -467,7 +453,6 @@ async def handle_webhook(request: Request):
                                         cursor.execute("UPDATE dm_tracking SET is_opened = TRUE WHERE user_id = %s AND page_id = %s", (reader_id, page_id))
                                 conn.commit()
                                 
-                    # HANDLE INCOMING TEXT MESSAGES (USER REPLY)
                     elif "message" in msg_event and not msg_event.get("message", {}).get("is_echo"):
                         sender_id = msg_event.get("sender", {}).get("id")
                         message_text = msg_event.get("message", {}).get("text", "").lower()
@@ -481,11 +466,9 @@ async def handle_webhook(request: Request):
                                         cursor.execute("SELECT * FROM campaigns WHERE id = %s AND is_active = 1", (tracking_row["campaign_id"],))
                                         campaign = cursor.fetchone()
                                         if campaign:
-                                            # Safely check trigger keywords for old campaigns
                                             raw_dm_trigger = campaign.get("dm_trigger_keywords") or ""
                                             keywords = [k.strip().lower() for k in raw_dm_trigger.split(",") if k.strip()]
                                             
-                                            # Match logic
                                             is_matched = False
                                             if not keywords:
                                                 is_matched = False
@@ -508,7 +491,6 @@ async def handle_webhook(request: Request):
                                                         "base_url": get_base_url(request)
                                                     })
                             
-            # --- HANDLE INCOMING COMMENTS ---
             for change in entry.get("changes", []):
                 value = change.get("value", {})
                 
@@ -573,7 +555,6 @@ async def handle_webhook(request: Request):
 # =========================================================
 @app.get(SECRET_ADMIN_PATH, response_class=HTMLResponse)
 async def dashboard():
-    # Helper to clean strings safely for Javascript attributes
     def escape_val(v):
         if not v:
             return ""
@@ -612,7 +593,6 @@ async def dashboard():
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         ctr = round((c["link_clicks"] / c["dms_sent"]) * 100, 1) if c["dms_sent"] > 0 else 0
         
-        # Safely scrub all text before injecting it into HTML so it never breaks the Edit button
         safe_name = escape_val(c.get('campaign_name'))
         safe_kw = escape_val(c.get('trigger_keywords'))
         safe_first_dm = escape_val(c.get('first_dm_text'))

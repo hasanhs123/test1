@@ -27,9 +27,7 @@ SECRET_ADMIN_PATH = "/earnflow-admin-7788"
 # =========================================================
 
 DB_URL = os.environ.get("DATABASE_URL")
-MAX_PER_HOUR = 700
 message_queue = asyncio.Queue()
-RATE_LIMIT_TRACKER = {}
 
 # =========================================================
 # 📝 RANDOMIZED UNIQUE COMMENT ENGINE
@@ -282,17 +280,6 @@ async def process_queue():
             token = job["token"]
             base_url = job["base_url"]
 
-            curr_time = time.time()
-            if page_id not in RATE_LIMIT_TRACKER:
-                RATE_LIMIT_TRACKER[page_id] = {"count": 0, "reset_time": curr_time}
-            if curr_time - RATE_LIMIT_TRACKER[page_id]["reset_time"] > 3600:
-                RATE_LIMIT_TRACKER[page_id] = {"count": 0, "reset_time": curr_time}
-            if RATE_LIMIT_TRACKER[page_id]["count"] >= MAX_PER_HOUR:
-                await asyncio.sleep(60)
-                await message_queue.put(job)
-                message_queue.task_done()
-                continue
-
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
 
@@ -341,7 +328,6 @@ async def process_queue():
                 try:
                     res = await client.post(url, json=payload, params={"access_token": token})
                     if res.status_code == 200:
-                        RATE_LIMIT_TRACKER[page_id]["count"] += 1
                         with get_db() as conn:
                             with conn.cursor() as cursor:
                                 cursor.execute("UPDATE campaigns SET dms_sent = dms_sent + 1 WHERE id = %s", (campaign["id"],))
@@ -398,7 +384,6 @@ async def process_queue():
                 try:
                     res = await client.post(url, json=payload, params={"access_token": token})
                     if res.status_code == 200:
-                        RATE_LIMIT_TRACKER[page_id]["count"] += 1
                         with get_db() as conn:
                             with conn.cursor() as cursor:
                                 cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
@@ -571,7 +556,6 @@ async def dashboard():
     
     pages_cards_html = ""
     for p in pages:
-        tracker = RATE_LIMIT_TRACKER.get(p["page_id"], {"count": 0})
         pages_cards_html += f"""
         <div class="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm flex justify-between items-center">
             <div>
@@ -581,8 +565,8 @@ async def dashboard():
             </div>
             <div class="text-right flex items-center gap-4">
                 <div>
-                    <span class="text-[9px] font-extrabold uppercase tracking-wider text-gray-400 block">Sent / Hour</span>
-                    <span class="font-extrabold text-sm text-green-600">{tracker["count"]} / 700</span>
+                    <span class="text-[9px] font-extrabold uppercase tracking-wider text-gray-400 block">Status</span>
+                    <span class="font-extrabold text-sm text-green-600">Active</span>
                 </div>
             </div>
         </div>

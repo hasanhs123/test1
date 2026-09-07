@@ -153,6 +153,14 @@ def init_db():
                     PRIMARY KEY (user_id, page_id)
                 )
             """)
+            # New table specifically to log unique link clicks
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS click_tracking (
+                    campaign_id INTEGER,
+                    user_id TEXT,
+                    PRIMARY KEY (campaign_id, user_id)
+                )
+            """)
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
@@ -231,18 +239,28 @@ async def auth_callback(request: Request, code: str = None):
     return RedirectResponse(SECRET_ADMIN_PATH)
 
 # =========================================================
-# 4. LINK CLICK TRACKER
+# 4. LINK CLICK TRACKER (UPDATED FOR UNIQUE CLICKS)
 # =========================================================
 @app.get("/click/{campaign_id}")
-async def track_link_click(campaign_id: int):
+async def track_link_click(campaign_id: int, uid: Optional[str] = None):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT button_url FROM campaigns WHERE id = %s", (campaign_id,))
             row = cursor.fetchone()
             
             if row and row["button_url"]:
-                cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = %s", (campaign_id,))
-                conn.commit()
+                if uid:
+                    # Check if this user has clicked this specific campaign's link before
+                    cursor.execute("SELECT 1 FROM click_tracking WHERE campaign_id = %s AND user_id = %s", (campaign_id, uid))
+                    already_clicked = cursor.fetchone()
+                    
+                    if not already_clicked:
+                        # Log them as a new clicker and increase the CTR count by 1
+                        cursor.execute("INSERT INTO click_tracking (campaign_id, user_id) VALUES (%s, %s)", (campaign_id, uid))
+                        cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = %s", (campaign_id,))
+                        conn.commit()
+                
+                # Always redirect them to the actual URL, even if they've clicked before
                 return RedirectResponse(row["button_url"])
             
     return PlainTextResponse("Link expired or invalid.")
@@ -357,7 +375,8 @@ async def process_queue():
                 personalized_text = personalized_text + invisible_space
 
                 if campaign.get("button_url"):
-                    tracking_url = f"{base_url}/click/{campaign['id']}"
+                    # UPDATED: Adding the user's specific sender_id to the tracking URL
+                    tracking_url = f"{base_url}/click/{campaign['id']}?uid={sender_id}"
                     link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
                     
                     payload = {

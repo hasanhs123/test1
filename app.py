@@ -153,7 +153,6 @@ def init_db():
                     PRIMARY KEY (user_id, page_id)
                 )
             """)
-            # New table specifically to log unique link clicks
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS click_tracking (
                     campaign_id INTEGER,
@@ -163,6 +162,7 @@ def init_db():
             """)
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0")
@@ -239,7 +239,7 @@ async def auth_callback(request: Request, code: str = None):
     return RedirectResponse(SECRET_ADMIN_PATH)
 
 # =========================================================
-# 4. LINK CLICK TRACKER (UPDATED FOR UNIQUE CLICKS)
+# 4. LINK CLICK TRACKER
 # =========================================================
 @app.get("/click/{campaign_id}")
 async def track_link_click(campaign_id: int, uid: Optional[str] = None):
@@ -250,17 +250,13 @@ async def track_link_click(campaign_id: int, uid: Optional[str] = None):
             
             if row and row["button_url"]:
                 if uid:
-                    # Check if this user has clicked this specific campaign's link before
                     cursor.execute("SELECT 1 FROM click_tracking WHERE campaign_id = %s AND user_id = %s", (campaign_id, uid))
                     already_clicked = cursor.fetchone()
                     
                     if not already_clicked:
-                        # Log them as a new clicker and increase the CTR count by 1
                         cursor.execute("INSERT INTO click_tracking (campaign_id, user_id) VALUES (%s, %s)", (campaign_id, uid))
                         cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = %s", (campaign_id,))
                         conn.commit()
-                
-                # Always redirect them to the actual URL, even if they've clicked before
                 return RedirectResponse(row["button_url"])
             
     return PlainTextResponse("Link expired or invalid.")
@@ -300,6 +296,7 @@ async def process_queue():
 
             full_name = sender_name.strip() if sender_name else "there"
             first_name = full_name.split(" ")[0] if full_name != "there" else "there"
+            api_url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
 
             if job_type == "comment_reply":
                 comment_id = job["comment_id"]
@@ -330,7 +327,6 @@ async def process_queue():
 
                 raw_first_dm = campaign.get("first_dm_text") or ""
                 if not raw_first_dm.strip():
-                    print(f"⚠️ WARNING: Initial DM is empty! Using default fallback text.")
                     raw_first_dm = "Hi {first_name}! You got it right! Are you ready for your reward? Reply YES to claim it."
 
                 first_dm_text = raw_first_dm.replace("{first_name}", first_name).replace("{full_name}", full_name)
@@ -341,10 +337,9 @@ async def process_queue():
                     "recipient": {"comment_id": comment_id},
                     "message": {"text": first_dm_text}
                 }
-                url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
 
                 try:
-                    res = await client.post(url, json=payload, params={"access_token": token})
+                    res = await client.post(api_url, json=payload, params={"access_token": token})
                     if res.status_code == 200:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
@@ -369,13 +364,37 @@ async def process_queue():
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
                 await asyncio.sleep(delay_second_dm)
 
+                # =========================================================
+                # 🔥 NEW FEATURE: SEND SCREENSHOT IMAGE FIRST
+                # =========================================================
+                image_url = campaign.get("image_url")
+                if image_url and image_url.strip():
+                    img_payload = {
+                        "recipient": {"id": sender_id},
+                        "message": {
+                            "attachment": {
+                                "type": "image",
+                                "payload": {"url": image_url.strip(), "is_reusable": True}
+                            }
+                        }
+                    }
+                    try:
+                        img_res = await client.post(api_url, json=img_payload, params={"access_token": token})
+                        if img_res.status_code == 200:
+                            print(f"✅ IMAGE ATTACHMENT sent to {sender_name}!")
+                            await asyncio.sleep(1.5) # Wait 1.5s to ensure proper sequence in messenger
+                        else:
+                            print(f"❌ META API IMAGE ERROR: {img_res.text}")
+                    except Exception as e:
+                        print(f"❌ ERROR SENDING IMAGE: {e}")
+                # =========================================================
+
                 raw_dm_text = campaign.get("dm_text") or ""
                 personalized_text = raw_dm_text.replace("{first_name}", first_name).replace("{full_name}", full_name)
                 invisible_space = "\u200B" * random.randint(1, 5)
                 personalized_text = personalized_text + invisible_space
 
                 if campaign.get("button_url"):
-                    # UPDATED: Adding the user's specific sender_id to the tracking URL
                     tracking_url = f"{base_url}/click/{campaign['id']}?uid={sender_id}"
                     link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
                     
@@ -398,10 +417,8 @@ async def process_queue():
                         "message": {"text": personalized_text}
                     }
 
-                url = f"https://graph.facebook.com/v21.0/{page_id}/messages"
-
                 try:
-                    res = await client.post(url, json=payload, params={"access_token": token})
+                    res = await client.post(api_url, json=payload, params={"access_token": token})
                     if res.status_code == 200:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
@@ -603,10 +620,11 @@ async def dashboard():
         safe_dm = escape_val(c.get('dm_text'))
         safe_btn_txt = escape_val(c.get('button_text'))
         safe_btn_url = escape_val(c.get('button_url'))
+        safe_img_url = escape_val(c.get('image_url'))
 
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -729,6 +747,10 @@ async def dashboard():
                         <label class="block font-bold text-gray-600 mb-1">Step 3: Final DM Text (With Button)</label>
                         <textarea name="dm_text" required rows="2" placeholder="Here is the link as promised!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
+                    <div class="mb-2">
+                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
+                        <input type="text" name="image_url" placeholder="https://example.com/screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
+                    </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
                         <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
@@ -765,6 +787,10 @@ async def dashboard():
                         <label class="block font-bold text-gray-600 mb-1">Step 3: Final DM Text (With Button)</label>
                         <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
+                    <div class="mb-2">
+                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
+                        <input type="text" name="image_url" id="edit_image_url" placeholder="https://example.com/screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
+                    </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
                         <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" id="edit_button_url" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
@@ -787,7 +813,7 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, first_dm, dm_trigger, dm_text, btn_text, btn_url) {{
+            function editCampaign(id, name, keywords, first_dm, dm_trigger, dm_text, btn_text, btn_url, img_url) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
@@ -796,6 +822,7 @@ async def dashboard():
                 document.getElementById('edit_dm_text').value = dm_text;
                 document.getElementById('edit_button_text').value = btn_text;
                 document.getElementById('edit_button_url').value = btn_url;
+                document.getElementById('edit_image_url').value = img_url;
                 document.getElementById('editCampaignModal').classList.remove('hidden');
             }}
 
@@ -851,6 +878,7 @@ async def add_campaign(
     first_dm_text: str = Form(...),
     dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
+    image_url: str = Form(""),
     button_text: str = Form(""), 
     button_url: str = Form("")
 ):
@@ -858,18 +886,19 @@ async def add_campaign(
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, dm_trigger_keywords, dm_text, button_text, button_url, is_active) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, dm_trigger_keywords, dm_text, image_url, button_text, button_url, is_active) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
                 ON CONFLICT (page_id, post_id) DO UPDATE SET 
                 campaign_name = EXCLUDED.campaign_name,
                 trigger_keywords = EXCLUDED.trigger_keywords,
                 first_dm_text = EXCLUDED.first_dm_text,
                 dm_trigger_keywords = EXCLUDED.dm_trigger_keywords,
                 dm_text = EXCLUDED.dm_text,
+                image_url = EXCLUDED.image_url,
                 button_text = EXCLUDED.button_text,
                 button_url = EXCLUDED.button_url,
                 is_active = 1
-            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip()))
+            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 
@@ -881,6 +910,7 @@ async def edit_campaign(
     first_dm_text: str = Form(...),
     dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
+    image_url: str = Form(""),
     button_text: str = Form(""), 
     button_url: str = Form("")
 ):
@@ -888,9 +918,9 @@ async def edit_campaign(
         with conn.cursor() as cursor:
             cursor.execute("""
                 UPDATE campaigns 
-                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, dm_trigger_keywords = %s, dm_text = %s, button_text = %s, button_url = %s
+                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, dm_trigger_keywords = %s, dm_text = %s, image_url = %s, button_text = %s, button_url = %s
                 WHERE id = %s
-            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), button_text.strip(), button_url.strip(), campaign_id))
+            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 

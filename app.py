@@ -136,6 +136,7 @@ def init_db():
                     button_url TEXT NOT NULL,
                     dms_sent INTEGER DEFAULT 0,
                     dms_opened INTEGER DEFAULT 0,
+                    trigger_replies INTEGER DEFAULT 0,
                     link_clicks INTEGER DEFAULT 0,
                     is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -163,6 +164,7 @@ def init_db():
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS trigger_replies INTEGER DEFAULT 0")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0")
@@ -364,9 +366,7 @@ async def process_queue():
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
                 await asyncio.sleep(delay_second_dm)
 
-                # =========================================================
-                # 🔥 NEW FEATURE: SEND SCREENSHOT IMAGE FIRST
-                # =========================================================
+                # Send screenshot image first
                 image_url = campaign.get("image_url")
                 if image_url and image_url.strip():
                     img_payload = {
@@ -382,12 +382,11 @@ async def process_queue():
                         img_res = await client.post(api_url, json=img_payload, params={"access_token": token})
                         if img_res.status_code == 200:
                             print(f"✅ IMAGE ATTACHMENT sent to {sender_name}!")
-                            await asyncio.sleep(1.5) # Wait 1.5s to ensure proper sequence in messenger
+                            await asyncio.sleep(1.5)
                         else:
                             print(f"❌ META API IMAGE ERROR: {img_res.text}")
                     except Exception as e:
                         print(f"❌ ERROR SENDING IMAGE: {e}")
-                # =========================================================
 
                 raw_dm_text = campaign.get("dm_text") or ""
                 personalized_text = raw_dm_text.replace("{first_name}", first_name).replace("{full_name}", full_name)
@@ -422,6 +421,8 @@ async def process_queue():
                     if res.status_code == 200:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
+                                # Increment trigger replies counter and remove tracking record
+                                cursor.execute("UPDATE campaigns SET trigger_replies = trigger_replies + 1 WHERE id = %s", (campaign["id"],))
                                 cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
                             conn.commit()
                         print(f"✅ SECOND DM (Payload) sent successfully to {sender_name}!")
@@ -611,7 +612,11 @@ async def dashboard():
     campaigns_rows_html = ""
     for c in campaigns:
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
-        ctr = round((c["link_clicks"] / c["dms_sent"]) * 100, 1) if c["dms_sent"] > 0 else 0
+        
+        # CTR calculated based on Trigger Replies (Keyword Typers)
+        replies_count = c.get("trigger_replies", 0) or 0
+        clicks_count = c.get("link_clicks", 0) or 0
+        ctr = round((clicks_count / replies_count) * 100, 1) if replies_count > 0 else 0.0
         
         safe_name = escape_val(c.get('campaign_name'))
         safe_kw = escape_val(c.get('trigger_keywords'))
@@ -639,7 +644,8 @@ async def dashboard():
             <td class="py-4 px-4"><span class="bg-gray-100 text-slate-700 px-2 py-1 rounded font-mono text-[11px] break-all">{c["trigger_keywords"]}</span></td>
             <td class="py-4 px-4 text-center font-bold text-slate-800">{c["dms_sent"]}</td>
             <td class="py-4 px-4 text-center font-bold text-blue-600">{c["dms_opened"]}</td>
-            <td class="py-4 px-4 text-center font-bold text-purple-600">{c["link_clicks"]}</td>
+            <td class="py-4 px-4 text-center font-bold text-amber-600 bg-amber-50/50 rounded-lg">{replies_count}</td>
+            <td class="py-4 px-4 text-center font-bold text-purple-600">{clicks_count}</td>
             <td class="py-4 px-4 text-center font-bold text-emerald-600">{ctr}%</td>
             <td class="py-4 px-4 text-center">{status}</td>
             <td class="py-4 px-4 text-right">{actions}</td>
@@ -661,7 +667,7 @@ async def dashboard():
             <div class="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center">
                 <div class="flex items-center gap-3">
                     <div class="w-10 h-10 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center font-bold text-xl"><i class="fa-solid fa-robot"></i></div>
-                    <div><h1 class="text-lg font-extrabold text-slate-900 leading-tight">EarnFlow Auto-DM Core</h1><p class="text-[11px] text-gray-400 font-semibold uppercase tracking-wider">Manychat-Style Automation</p></div>
+                    <div><h1 class="text-lg font-extrabold text-slate-900 leading-tight">EarnFlow Auto-DM Core</h1><p class="text-[11px] text-gray-400 font-semibold uppercase tracking-wider">Funnel Conversion Analytics</p></div>
                 </div>
             </div>
         </header>
@@ -694,13 +700,14 @@ async def dashboard():
                                     <th class="py-3 px-4">Keywords</th>
                                     <th class="py-3 px-4 text-center">Sent</th>
                                     <th class="py-3 px-4 text-center">Opened</th>
+                                    <th class="py-3 px-4 text-center text-amber-600">Triggered</th>
                                     <th class="py-3 px-4 text-center">Clicks</th>
                                     <th class="py-3 px-4 text-center">CTR</th>
                                     <th class="py-3 px-4 text-center">Status</th>
                                     <th class="py-3 px-4 text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="9" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
+                            <tbody>{campaigns_rows_html if campaigns else '<tr><td colspan="10" class="text-center py-8 text-gray-400 text-xs">No active automations.</td></tr>'}</tbody>
                         </table>
                     </div>
                 </div>
@@ -735,7 +742,7 @@ async def dashboard():
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
-                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get $5000/month ebook guide?" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get the direct guide? Reply YES to get the screenshot link!" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                         </div>
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>
@@ -749,7 +756,7 @@ async def dashboard():
                     </div>
                     <div class="mb-2">
                         <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
-                        <input type="text" name="image_url" placeholder="https://example.com/screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
+                        <input type="text" name="image_url" placeholder="https://i.ibb.co/.../screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
                         <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
@@ -789,7 +796,7 @@ async def dashboard():
                     </div>
                     <div class="mb-2">
                         <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
-                        <input type="text" name="image_url" id="edit_image_url" placeholder="https://example.com/screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
+                        <input type="text" name="image_url" id="edit_image_url" placeholder="https://i.ibb.co/.../screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
                         <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>

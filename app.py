@@ -162,6 +162,8 @@ def init_db():
                 )
             """)
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_text TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_button_text TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS first_dm_button_url TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS trigger_replies INTEGER DEFAULT 0")
@@ -244,13 +246,13 @@ async def auth_callback(request: Request, code: str = None):
 # 4. LINK CLICK TRACKER
 # =========================================================
 @app.get("/click/{campaign_id}")
-async def track_link_click(campaign_id: int, uid: Optional[str] = None):
+async def track_link_click(campaign_id: int, uid: Optional[str] = None, step: Optional[int] = 2):
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT button_url FROM campaigns WHERE id = %s", (campaign_id,))
+            cursor.execute("SELECT button_url, first_dm_button_url FROM campaigns WHERE id = %s", (campaign_id,))
             row = cursor.fetchone()
             
-            if row and row["button_url"]:
+            if row:
                 if uid:
                     cursor.execute("SELECT 1 FROM click_tracking WHERE campaign_id = %s AND user_id = %s", (campaign_id, uid))
                     already_clicked = cursor.fetchone()
@@ -259,7 +261,12 @@ async def track_link_click(campaign_id: int, uid: Optional[str] = None):
                         cursor.execute("INSERT INTO click_tracking (campaign_id, user_id) VALUES (%s, %s)", (campaign_id, uid))
                         cursor.execute("UPDATE campaigns SET link_clicks = link_clicks + 1 WHERE id = %s", (campaign_id,))
                         conn.commit()
-                return RedirectResponse(row["button_url"])
+                
+                redirect_url = row["first_dm_button_url"] if step == 1 and row["first_dm_button_url"] else row["button_url"]
+                if redirect_url:
+                    return RedirectResponse(redirect_url)
+                elif row["button_url"]:
+                    return RedirectResponse(row["button_url"])
             
     return PlainTextResponse("Link expired or invalid.")
 
@@ -335,13 +342,34 @@ async def process_queue():
                 invisible_space = "\u200B" * random.randint(1, 5)
                 first_dm_text = first_dm_text + invisible_space
 
-                payload = {
-                    "recipient": {"comment_id": comment_id},
-                    "message": {"text": first_dm_text}
-                }
+                # Optional Button for Initial DM
+                first_btn_url = campaign.get("first_dm_button_url")
+                
+                if first_btn_url and first_btn_url.strip():
+                    tracking_url_first = f"{base_url}/click/{campaign['id']}?uid={sender_id}&step=1"
+                    link_title_first = campaign.get("first_dm_button_text", "Click Here") if campaign.get("first_dm_button_text") else "Click Here"
+                    
+                    payload_text = {
+                        "recipient": {"comment_id": comment_id},
+                        "message": {
+                            "attachment": {
+                                "type": "template",
+                                "payload": {
+                                    "template_type": "button",
+                                    "text": first_dm_text,
+                                    "buttons": [{"type": "web_url", "url": tracking_url_first, "title": link_title_first}]
+                                }
+                            }
+                        }
+                    }
+                else:
+                    payload_text = {
+                        "recipient": {"comment_id": comment_id},
+                        "message": {"text": first_dm_text}
+                    }
 
                 try:
-                    res = await client.post(api_url, json=payload, params={"access_token": token})
+                    res = await client.post(api_url, json=payload_text, params={"access_token": token})
                     if res.status_code == 200:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
@@ -366,7 +394,7 @@ async def process_queue():
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
                 await asyncio.sleep(delay_second_dm)
 
-                # Send screenshot image first
+                # Send screenshot image first (Moved back to Step 2)
                 image_url = campaign.get("image_url")
                 if image_url and image_url.strip():
                     img_payload = {
@@ -394,7 +422,7 @@ async def process_queue():
                 personalized_text = personalized_text + invisible_space
 
                 if campaign.get("button_url"):
-                    tracking_url = f"{base_url}/click/{campaign['id']}?uid={sender_id}"
+                    tracking_url = f"{base_url}/click/{campaign['id']}?uid={sender_id}&step=2"
                     link_title = campaign.get("button_text", "Click Here") if campaign.get("button_text") else "Click Here"
                     
                     payload = {
@@ -421,7 +449,6 @@ async def process_queue():
                     if res.status_code == 200:
                         with get_db() as conn:
                             with conn.cursor() as cursor:
-                                # Increment trigger replies counter and remove tracking record
                                 cursor.execute("UPDATE campaigns SET trigger_replies = trigger_replies + 1 WHERE id = %s", (campaign["id"],))
                                 cursor.execute("DELETE FROM dm_tracking WHERE user_id = %s AND page_id = %s", (sender_id, page_id))
                             conn.commit()
@@ -613,7 +640,6 @@ async def dashboard():
     for c in campaigns:
         status = '<span class="bg-green-50 text-green-700 text-[10px] font-extrabold px-2.5 py-1 rounded border border-green-100">ON</span>' if c["is_active"] else '<span class="bg-gray-100 text-gray-500 text-[10px] font-extrabold px-2.5 py-1 rounded">OFF</span>'
         
-        # CTR calculated based on Trigger Replies (Keyword Typers)
         replies_count = c.get("trigger_replies", 0) or 0
         clicks_count = c.get("link_clicks", 0) or 0
         ctr = round((clicks_count / replies_count) * 100, 1) if replies_count > 0 else 0.0
@@ -621,6 +647,8 @@ async def dashboard():
         safe_name = escape_val(c.get('campaign_name'))
         safe_kw = escape_val(c.get('trigger_keywords'))
         safe_first_dm = escape_val(c.get('first_dm_text'))
+        safe_first_btn_txt = escape_val(c.get('first_dm_button_text'))
+        safe_first_btn_url = escape_val(c.get('first_dm_button_url'))
         safe_dm_trigger = escape_val(c.get('dm_trigger_keywords'))
         safe_dm = escape_val(c.get('dm_text'))
         safe_btn_txt = escape_val(c.get('button_text'))
@@ -629,7 +657,7 @@ async def dashboard():
 
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_first_btn_txt}', '{safe_first_btn_url}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -741,8 +769,12 @@ async def dashboard():
                     
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
                         <div>
-                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
-                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get the direct guide? Reply YES to get the screenshot link!" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text</label>
+                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get the direct guide? Reply YES to get the link!" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div><label class="block font-bold text-blue-800 mb-1">Initial Link Title (Optional)</label><input type="text" name="first_dm_button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-blue-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                            <div><label class="block font-bold text-blue-800 mb-1">Initial URL (Optional)</label><input type="text" name="first_dm_button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-blue-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                         </div>
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>
@@ -755,12 +787,12 @@ async def dashboard():
                         <textarea name="dm_text" required rows="2" placeholder="Here is the link as promised!" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="mb-2">
-                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
+                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot sent in Step 2)</label>
                         <input type="text" name="image_url" placeholder="https://i.ibb.co/.../screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
-                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Final Link Title (Optional)</label><input type="text" name="button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Final URL (Optional)</label><input type="text" name="button_url" placeholder="https://..." class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Deploy Automation</button>
                 </form>
@@ -781,8 +813,12 @@ async def dashboard():
 
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
                         <div>
-                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text (Plain Text)</label>
+                            <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text</label>
                             <textarea name="first_dm_text" id="edit_first_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div><label class="block font-bold text-blue-800 mb-1">Initial Link Title (Optional)</label><input type="text" name="first_dm_button_text" id="edit_first_dm_button_text" class="w-full px-3.5 py-2 bg-white border border-blue-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                            <div><label class="block font-bold text-blue-800 mb-1">Initial URL (Optional)</label><input type="text" name="first_dm_button_url" id="edit_first_dm_button_url" class="w-full px-3.5 py-2 bg-white border border-blue-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                         </div>
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 2: User Reply Trigger Words</label>
@@ -795,12 +831,12 @@ async def dashboard():
                         <textarea name="dm_text" id="edit_dm_text" required rows="2" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                     </div>
                     <div class="mb-2">
-                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot)</label>
-                        <input type="text" name="image_url" id="edit_image_url" placeholder="https://i.ibb.co/.../screenshot.jpg" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
+                        <label class="block font-bold text-gray-600 mb-1">Image URL (Optional Screenshot sent in Step 2)</label>
+                        <input type="text" name="image_url" id="edit_image_url" placeholder="https://i.ibb.co/.../screenshot.jpg" class="w-full px-3.5 py-2.5 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500">
                     </div>
                     <div class="grid grid-cols-2 gap-3 bg-gray-50 p-3 rounded-xl border border-gray-200">
-                        <div><label class="block font-bold text-gray-600 mb-1">Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
-                        <div><label class="block font-bold text-gray-600 mb-1">URL Link (Optional)</label><input type="text" name="button_url" id="edit_button_url" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Final Link Title (Optional)</label><input type="text" name="button_text" id="edit_button_text" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
+                        <div><label class="block font-bold text-gray-600 mb-1">Final URL (Optional)</label><input type="text" name="button_url" id="edit_button_url" class="w-full px-3.5 py-2 bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
                     </div>
                     <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold uppercase tracking-wider text-xs transition mt-2 shadow-md">Save Changes</button>
                 </form>
@@ -820,11 +856,13 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, first_dm, dm_trigger, dm_text, btn_text, btn_url, img_url) {{
+            function editCampaign(id, name, keywords, first_dm, first_btn_text, first_btn_url, dm_trigger, dm_text, btn_text, btn_url, img_url) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
                 document.getElementById('edit_first_dm_text').value = first_dm;
+                document.getElementById('edit_first_dm_button_text').value = first_btn_text;
+                document.getElementById('edit_first_dm_button_url').value = first_btn_url;
                 document.getElementById('edit_dm_trigger_keywords').value = dm_trigger;
                 document.getElementById('edit_dm_text').value = dm_text;
                 document.getElementById('edit_button_text').value = btn_text;
@@ -883,6 +921,8 @@ async def add_campaign(
     post_id: str = Form(...), 
     trigger_keywords: str = Form(...), 
     first_dm_text: str = Form(...),
+    first_dm_button_text: str = Form(""),
+    first_dm_button_url: str = Form(""),
     dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
     image_url: str = Form(""),
@@ -893,19 +933,21 @@ async def add_campaign(
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, dm_trigger_keywords, dm_text, image_url, button_text, button_url, is_active) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, first_dm_button_text, first_dm_button_url, dm_trigger_keywords, dm_text, image_url, button_text, button_url, is_active) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
                 ON CONFLICT (page_id, post_id) DO UPDATE SET 
                 campaign_name = EXCLUDED.campaign_name,
                 trigger_keywords = EXCLUDED.trigger_keywords,
                 first_dm_text = EXCLUDED.first_dm_text,
+                first_dm_button_text = EXCLUDED.first_dm_button_text,
+                first_dm_button_url = EXCLUDED.first_dm_button_url,
                 dm_trigger_keywords = EXCLUDED.dm_trigger_keywords,
                 dm_text = EXCLUDED.dm_text,
                 image_url = EXCLUDED.image_url,
                 button_text = EXCLUDED.button_text,
                 button_url = EXCLUDED.button_url,
                 is_active = 1
-            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip()))
+            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 
@@ -915,6 +957,8 @@ async def edit_campaign(
     campaign_name: str = Form(...), 
     trigger_keywords: str = Form(...), 
     first_dm_text: str = Form(...),
+    first_dm_button_text: str = Form(""),
+    first_dm_button_url: str = Form(""),
     dm_trigger_keywords: str = Form(...),
     dm_text: str = Form(...), 
     image_url: str = Form(""),
@@ -925,9 +969,9 @@ async def edit_campaign(
         with conn.cursor() as cursor:
             cursor.execute("""
                 UPDATE campaigns 
-                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, dm_trigger_keywords = %s, dm_text = %s, image_url = %s, button_text = %s, button_url = %s
+                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, first_dm_button_text = %s, first_dm_button_url = %s, dm_trigger_keywords = %s, dm_text = %s, image_url = %s, button_text = %s, button_url = %s
                 WHERE id = %s
-            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
+            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 

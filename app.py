@@ -167,6 +167,7 @@ def init_db():
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dm_trigger_keywords TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS trigger_replies INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS reply_publicly INTEGER DEFAULT 1")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS is_opened BOOLEAN DEFAULT FALSE")
             cursor.execute("ALTER TABLE dm_tracking ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT ''")
             cursor.execute("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS dms_opened INTEGER DEFAULT 0")
@@ -311,19 +312,23 @@ async def process_queue():
                 comment_id = job["comment_id"]
                 is_correct = job["is_correct"]
 
-                delay_public = random.randint(5, 10)
-                print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
-                await asyncio.sleep(delay_public)
-                
-                try:
-                    reply_text = get_unique_reply(is_correct)
-                    reply_url = f"https://graph.facebook.com/v21.0/{comment_id}/comments"
-                    res_reply = await client.post(reply_url, data={"message": reply_text}, params={"access_token": token})
-                    if res_reply.status_code == 200:
-                        status_type = "CORRECT" if is_correct else "WRONG"
-                        print(f"✅ {status_type} Public reply posted: \"{reply_text}\"")
-                except Exception as e:
-                    print(f"❌ NETWORK EXCEPTION POSTING REPLY: {e}")
+                # Optional Public Reply logic
+                if campaign.get("reply_publicly", 1) == 1:
+                    delay_public = random.randint(5, 10)
+                    print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
+                    await asyncio.sleep(delay_public)
+                    
+                    try:
+                        reply_text = get_unique_reply(is_correct)
+                        reply_url = f"https://graph.facebook.com/v21.0/{comment_id}/comments"
+                        res_reply = await client.post(reply_url, data={"message": reply_text}, params={"access_token": token})
+                        if res_reply.status_code == 200:
+                            status_type = "CORRECT" if is_correct else "WRONG"
+                            print(f"✅ {status_type} Public reply posted: \"{reply_text}\"")
+                    except Exception as e:
+                        print(f"❌ NETWORK EXCEPTION POSTING REPLY: {e}")
+                else:
+                    print(f"🎯 COMMENT DETECTED! Public reply disabled. Proceeding directly to DM phase for {sender_name}...")
 
                 if not is_correct:
                     print(f"⏭️ Answer incorrect. Skipping DM for {sender_name}.")
@@ -342,7 +347,6 @@ async def process_queue():
                 invisible_space = "\u200B" * random.randint(1, 5)
                 first_dm_text = first_dm_text + invisible_space
 
-                # Optional Button for Initial DM
                 first_btn_url = campaign.get("first_dm_button_url")
                 
                 if first_btn_url and first_btn_url.strip():
@@ -394,7 +398,6 @@ async def process_queue():
                 print(f"🎯 TRIGGER WORD MATCHED! Waiting {delay_second_dm}s before sending BUTTON DM to {sender_name}...")
                 await asyncio.sleep(delay_second_dm)
 
-                # Send screenshot image first (Moved back to Step 2)
                 image_url = campaign.get("image_url")
                 if image_url and image_url.strip():
                     img_payload = {
@@ -646,6 +649,7 @@ async def dashboard():
         
         safe_name = escape_val(c.get('campaign_name'))
         safe_kw = escape_val(c.get('trigger_keywords'))
+        safe_reply_pub = c.get('reply_publicly', 1)
         safe_first_dm = escape_val(c.get('first_dm_text'))
         safe_first_btn_txt = escape_val(c.get('first_dm_button_text'))
         safe_first_btn_url = escape_val(c.get('first_dm_button_url'))
@@ -657,7 +661,7 @@ async def dashboard():
 
         actions = f"""
         <div class="flex items-center justify-end gap-3">
-            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', '{safe_first_dm}', '{safe_first_btn_txt}', '{safe_first_btn_url}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
+            <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', {safe_reply_pub}, '{safe_first_dm}', '{safe_first_btn_txt}', '{safe_first_btn_url}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
             <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
@@ -767,10 +771,15 @@ async def dashboard():
                         <div><label class="block font-bold text-gray-600 mb-1">Comment Trigger (Use * for all)</label><input type="text" name="trigger_keywords" required placeholder="91, 97" class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                     </div>
                     
+                    <div class="flex items-center gap-2 mt-1">
+                        <input type="checkbox" name="reply_publicly" id="reply_publicly" checked class="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500">
+                        <label for="reply_publicly" class="text-xs font-bold text-gray-700">Reply publicly to the user's comment</label>
+                    </div>
+                    
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
                         <div>
                             <label class="block font-bold text-blue-800 mb-1">Step 1: Initial DM Text</label>
-                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get the direct guide? Reply YES to get the link!" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
+                            <textarea name="first_dm_text" required rows="2" placeholder="Hi {{{{first_name}}}}! Do you want to get the direct guide? Reply YES!" class="w-full px-3.5 py-2.5 bg-white border border-blue-200 rounded-xl focus:outline-none focus:border-blue-500"></textarea>
                         </div>
                         <div class="grid grid-cols-2 gap-3">
                             <div><label class="block font-bold text-blue-800 mb-1">Initial Link Title (Optional)</label><input type="text" name="first_dm_button_text" placeholder="e.g. Download Now" class="w-full px-3.5 py-2 bg-white border border-blue-200 rounded-lg focus:outline-none focus:border-blue-500"></div>
@@ -809,6 +818,11 @@ async def dashboard():
                     <div class="grid grid-cols-2 gap-3">
                         <div><label class="block font-bold text-gray-600 mb-1">Rule Name</label><input type="text" name="campaign_name" id="edit_campaign_name" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
                         <div><label class="block font-bold text-gray-600 mb-1">Comment Trigger (Use * for all)</label><input type="text" name="trigger_keywords" id="edit_trigger_keywords" required class="w-full px-3.5 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:border-blue-500"></div>
+                    </div>
+
+                    <div class="flex items-center gap-2 mt-1">
+                        <input type="checkbox" name="reply_publicly" id="edit_reply_publicly" class="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500">
+                        <label for="edit_reply_publicly" class="text-xs font-bold text-gray-700">Reply publicly to the user's comment</label>
                     </div>
 
                     <div class="p-3 bg-blue-50 border border-blue-100 rounded-xl space-y-3">
@@ -856,10 +870,11 @@ async def dashboard():
                 element.classList.add('ring-2', 'ring-blue-500', 'bg-blue-50');
             }}
 
-            function editCampaign(id, name, keywords, first_dm, first_btn_text, first_btn_url, dm_trigger, dm_text, btn_text, btn_url, img_url) {{
+            function editCampaign(id, name, keywords, reply_publicly, first_dm, first_btn_text, first_btn_url, dm_trigger, dm_text, btn_text, btn_url, img_url) {{
                 document.getElementById('edit_campaign_id').value = id;
                 document.getElementById('edit_campaign_name').value = name;
                 document.getElementById('edit_trigger_keywords').value = keywords;
+                document.getElementById('edit_reply_publicly').checked = (reply_publicly === 1 || reply_publicly === '1');
                 document.getElementById('edit_first_dm_text').value = first_dm;
                 document.getElementById('edit_first_dm_button_text').value = first_btn_text;
                 document.getElementById('edit_first_dm_button_url').value = first_btn_url;
@@ -920,6 +935,7 @@ async def add_campaign(
     campaign_name: str = Form(...), 
     post_id: str = Form(...), 
     trigger_keywords: str = Form(...), 
+    reply_publicly: str = Form(None),
     first_dm_text: str = Form(...),
     first_dm_button_text: str = Form(""),
     first_dm_button_url: str = Form(""),
@@ -930,14 +946,17 @@ async def add_campaign(
     button_url: str = Form("")
 ):
     clean_post_id = post_id.strip().split("_")[-1] if "_" in post_id else post_id.strip()
+    is_public_reply = 1 if reply_publicly == "on" else 0
+    
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, first_dm_text, first_dm_button_text, first_dm_button_url, dm_trigger_keywords, dm_text, image_url, button_text, button_url, is_active) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                INSERT INTO campaigns (page_id, post_id, campaign_name, trigger_keywords, reply_publicly, first_dm_text, first_dm_button_text, first_dm_button_url, dm_trigger_keywords, dm_text, image_url, button_text, button_url, is_active) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
                 ON CONFLICT (page_id, post_id) DO UPDATE SET 
                 campaign_name = EXCLUDED.campaign_name,
                 trigger_keywords = EXCLUDED.trigger_keywords,
+                reply_publicly = EXCLUDED.reply_publicly,
                 first_dm_text = EXCLUDED.first_dm_text,
                 first_dm_button_text = EXCLUDED.first_dm_button_text,
                 first_dm_button_url = EXCLUDED.first_dm_button_url,
@@ -947,7 +966,7 @@ async def add_campaign(
                 button_text = EXCLUDED.button_text,
                 button_url = EXCLUDED.button_url,
                 is_active = 1
-            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip()))
+            """, (page_id.strip(), clean_post_id, campaign_name.strip(), trigger_keywords.strip().lower(), is_public_reply, first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip()))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 
@@ -956,6 +975,7 @@ async def edit_campaign(
     campaign_id: int = Form(...), 
     campaign_name: str = Form(...), 
     trigger_keywords: str = Form(...), 
+    reply_publicly: str = Form(None),
     first_dm_text: str = Form(...),
     first_dm_button_text: str = Form(""),
     first_dm_button_url: str = Form(""),
@@ -965,23 +985,15 @@ async def edit_campaign(
     button_text: str = Form(""), 
     button_url: str = Form("")
 ):
+    is_public_reply = 1 if reply_publicly == "on" else 0
+    
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
                 UPDATE campaigns 
-                SET campaign_name = %s, trigger_keywords = %s, first_dm_text = %s, first_dm_button_text = %s, first_dm_button_url = %s, dm_trigger_keywords = %s, dm_text = %s, image_url = %s, button_text = %s, button_url = %s
+                SET campaign_name = %s, trigger_keywords = %s, reply_publicly = %s, first_dm_text = %s, first_dm_button_text = %s, first_dm_button_url = %s, dm_trigger_keywords = %s, dm_text = %s, image_url = %s, button_text = %s, button_url = %s
                 WHERE id = %s
-            """, (campaign_name.strip(), trigger_keywords.strip().lower(), first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
-        conn.commit()
-    return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
-
-@app.post(f"{SECRET_ADMIN_PATH}/delete-campaign")
-async def delete_campaign(
-    campaign_id: int = Form(...)
-):
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))
+            """, (campaign_name.strip(), trigger_keywords.strip().lower(), is_public_reply, first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 

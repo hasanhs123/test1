@@ -312,7 +312,6 @@ async def process_queue():
                 comment_id = job["comment_id"]
                 is_correct = job["is_correct"]
 
-                # Optional Public Reply logic
                 if campaign.get("reply_publicly", 1) == 1:
                     delay_public = random.randint(5, 10)
                     print(f"🎯 COMMENT DETECTED! Waiting {delay_public}s before public reply to {sender_name}...")
@@ -661,8 +660,12 @@ async def dashboard():
 
         actions = f"""
         <div class="flex items-center justify-end gap-3">
+            <form action="{SECRET_ADMIN_PATH}/toggle-campaign" method="post" class="inline m-0 p-0">
+                <input type="hidden" name="campaign_id" value="{c['id']}">
+                <button type="submit" class="text-xs font-bold {'text-amber-500 hover:text-amber-700' if c['is_active'] else 'text-green-500 hover:text-green-700'} transition"><i class="fa-solid fa-power-off"></i> {'Disable' if c['is_active'] else 'Enable'}</button>
+            </form>
             <button onclick="editCampaign({c['id']}, '{safe_name}', '{safe_kw}', {safe_reply_pub}, '{safe_first_dm}', '{safe_first_btn_txt}', '{safe_first_btn_url}', '{safe_dm_trigger}', '{safe_dm}', '{safe_btn_txt}', '{safe_btn_url}', '{safe_img_url}')" class="text-xs font-bold text-blue-500 hover:text-blue-700 transition"><i class="fa-solid fa-pen"></i> Edit</button>
-            <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign?');" class="inline m-0 p-0">
+            <form action="{SECRET_ADMIN_PATH}/delete-campaign" method="post" onsubmit="return confirm('Delete campaign? This will permanently wipe out its tracking data.');" class="inline m-0 p-0">
                 <input type="hidden" name="campaign_id" value="{c['id']}">
                 <button type="submit" class="text-xs font-bold text-red-400 hover:text-red-600 transition"><i class="fa-solid fa-trash"></i></button>
             </form>
@@ -995,6 +998,35 @@ async def edit_campaign(
                 WHERE id = %s
             """, (campaign_name.strip(), trigger_keywords.strip().lower(), is_public_reply, first_dm_text.strip(), first_dm_button_text.strip(), first_dm_button_url.strip(), dm_trigger_keywords.strip().lower(), dm_text.strip(), image_url.strip(), button_text.strip(), button_url.strip(), campaign_id))
         conn.commit()
+    return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
+
+@app.post(f"{SECRET_ADMIN_PATH}/toggle-campaign")
+async def toggle_campaign(campaign_id: int = Form(...)):
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE campaigns SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = %s", (campaign_id,))
+        conn.commit()
+    return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
+
+@app.post(f"{SECRET_ADMIN_PATH}/delete-campaign")
+async def delete_campaign(campaign_id: int = Form(...)):
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            # 1. Safely wipe associated tracking data first to prevent database crashes
+            cursor.execute("DELETE FROM click_tracking WHERE campaign_id = %s", (campaign_id,))
+            cursor.execute("DELETE FROM dm_tracking WHERE campaign_id = %s", (campaign_id,))
+            # 2. Finally, delete the campaign itself
+            cursor.execute("DELETE FROM campaigns WHERE id = %s", (campaign_id,))
+        conn.commit()
+    return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
+
+# Add GET fallback endpoints to catch accidental page refreshes that cause the "Not Found" JSON page
+@app.get(f"{SECRET_ADMIN_PATH}/delete-campaign")
+async def delete_campaign_get():
+    return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
+
+@app.get(f"{SECRET_ADMIN_PATH}/toggle-campaign")
+async def toggle_campaign_get():
     return RedirectResponse(url=SECRET_ADMIN_PATH, status_code=303)
 
 if __name__ == "__main__":
